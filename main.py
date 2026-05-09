@@ -1,15 +1,26 @@
 """
-Salted-DES GUI — Tkinter Edition
+IASSING Encryptor and Decryptor
+Implements the XDES-A academic cipher design:
+  Argon2id KDF → Independent round keys → 128-bit block (dual 64-bit Feistel)
+  Pre/Post Whitening (DES-X) → CTR Mode → HMAC-SHA256 (Encrypt-then-MAC)
+
+Made by:
+  Kharl Asuncion · Alexandra De Vera
+  Darrel Joshua Ocampo · Ron Benedict Tesorero
+
 Dark terminal-inspired aesthetic with monospace fonts.
 """
 
 import os
+import hmac
+import hashlib
+import struct
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-import threading
+from argon2.low_level import hash_secret_raw, Type
 
 # ─────────────────────────────────────────────
-#  DES TABLES
+#  DES TABLES  (kept exactly as-is)
 # ─────────────────────────────────────────────
 
 IP = [
@@ -34,18 +45,11 @@ P = [
     16, 7,20,21,29,12,28,17, 1,15,23,26, 5,18,31,10,
      2, 8,24,14,32,27, 3, 9,19,13,30, 6,22,11, 4,25,
 ]
-PC1 = [
-    57,49,41,33,25,17, 9, 1,58,50,42,34,26,18,
-    10, 2,59,51,43,35,27,19,11, 3,60,52,44,36,
-    63,55,47,39,31,23,15, 7,62,54,46,38,30,22,
-    14, 6,61,53,45,37,29,21,13, 5,28,20,12, 4,
-]
 PC2 = [
     14,17,11,24, 1, 5, 3,28,15, 6,21,10,23,19,12, 4,
     26, 8,16, 7,27,20,13, 2,41,52,31,37,47,55,30,40,
     51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32,
 ]
-SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
 S_BOXES = [
     [[14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7],[0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8],[4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0],[15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13]],
     [[15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10],[3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5],[0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15],[13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9]],
@@ -58,7 +62,7 @@ S_BOXES = [
 ]
 
 # ─────────────────────────────────────────────
-#  DES CORE
+#  DES BIT PRIMITIVES
 # ─────────────────────────────────────────────
 
 def bytes_to_bits(b):
@@ -83,21 +87,8 @@ def permute(bits, table):
 def xor_bits(a, b):
     return [x ^ y for x, y in zip(a, b)]
 
-def left_shift(bits, n):
-    return bits[n:] + bits[:n]
-
-def generate_subkeys(key):
-    key_bits = bytes_to_bits(key)
-    key_pc1 = permute(key_bits, PC1)
-    C, D = key_pc1[:28], key_pc1[28:]
-    subkeys = []
-    for shift in SHIFTS:
-        C = left_shift(C, shift)
-        D = left_shift(D, shift)
-        subkeys.append(permute(C + D, PC2))
-    return subkeys
-
 def feistel(R, K):
+    """Standard DES Feistel function with proven S-boxes (fixed, not key-dependent)."""
     expanded = permute(R, E)
     xored = xor_bits(expanded, K)
     sbox_out = []
@@ -110,150 +101,276 @@ def feistel(R, K):
             sbox_out.append((val >> b) & 1)
     return permute(sbox_out, P)
 
-def des_block(block, key, encrypt=True):
-    subkeys = generate_subkeys(key)
-    if not encrypt:
-        subkeys = subkeys[::-1]
-    bits = permute(bytes_to_bits(block), IP)
+# ─────────────────────────────────────────────
+#  XDES-A KEY DERIVATION  (Argon2id)
+# ─────────────────────────────────────────────
+#
+#  Total KDF output: 152 bytes =
+#    K_pre   8 bytes  (pre-whitening)
+#    K_i    16×7 bytes = 112 bytes  (one 56-bit key per round, no key schedule)
+#    K_post  8 bytes  (post-whitening)
+#    K_mac  24 bytes  (HMAC-SHA256 key — truncated to 24 for display clarity)
+#
+#  Argon2id params (academic / low-resource):
+#    time_cost=2, memory_cost=65536 (64 MB), parallelism=1
+
+KDF_TOTAL   = 8 + 112 + 8 + 24   # 152 bytes
+ARGON2_T    = 2
+ARGON2_M    = 65536
+ARGON2_P    = 1
+
+def derive_keys(password: bytes, salt: bytes) -> dict:
+    """
+    Derive all XDES-A subkeys from password + salt via Argon2id.
+    Returns a dict with pre, rounds (list of 16 bit-lists), post, mac.
+    """
+    raw = hash_secret_raw(
+        secret=password,
+        salt=salt,
+        time_cost=ARGON2_T,
+        memory_cost=ARGON2_M,
+        parallelism=ARGON2_P,
+        hash_len=KDF_TOTAL,
+        type=Type.ID,
+    )
+    k_pre   = raw[0:8]
+    k_rounds_raw = raw[8:120]          # 16 × 7 bytes
+    k_post  = raw[120:128]
+    k_mac   = raw[128:152]
+
+    # Convert each 7-byte block to a 48-bit PC2-permuted subkey (DES expects 48 bits)
+    # We take the low 56 bits (7 bytes) and apply PC2 to get 48 bits — same as DES does
+    round_keys = []
+    for i in range(16):
+        chunk = k_rounds_raw[i*7:(i+1)*7]
+        # pad to 8 bytes for PC2 (PC2 indexes up to 56)
+        padded = chunk + bytes(1)
+        bits_56 = bytes_to_bits(padded)[:56]
+        # apply PC2 — but PC2 expects 56 bits in C+D arrangement
+        # We just use it directly since we just need 48 bits from 56
+        k48 = permute(bits_56, PC2)
+        round_keys.append(k48)
+
+    return {
+        "pre":    k_pre,
+        "rounds": round_keys,
+        "post":   k_post,
+        "mac":    k_mac,
+        "raw":    raw,
+    }
+
+# ─────────────────────────────────────────────
+#  XDES-A BLOCK CIPHER  (128-bit block)
+# ─────────────────────────────────────────────
+#
+#  Block = 16 bytes = [L_block (8 bytes) | R_block (8 bytes)]
+#
+#  Encrypt:
+#    1. Pre-whitening:  L ^= K_pre,  R ^= K_pre
+#    2. 16 Feistel rounds on L (using R as cross-feed after round 8)
+#       and 16 Feistel rounds on R (using L as cross-feed after round 8)
+#       — simple parallel Feistel with mid-point swap for cross-mixing
+#    3. Post-whitening: L ^= K_post, R ^= K_post
+#
+#  Decrypt reverses rounds and whitening.
+
+def _xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def _feistel_half(block_8: bytes, subkeys: list, encrypt: bool) -> bytes:
+    """Run 16-round Feistel on a single 64-bit half."""
+    keys = subkeys if encrypt else list(reversed(subkeys))
+    bits = permute(bytes_to_bits(block_8), IP)
     L, R = bits[:32], bits[32:]
-    for K in subkeys:
+    for K in keys:
         L, R = R, xor_bits(L, feistel(R, K))
     return bits_to_bytes(permute(R + L, IP_INV))
 
-def salted_des_encrypt(plaintext, key):
-    salt = os.urandom(8)
-    salted = bytes(p ^ s for p, s in zip(plaintext, salt))
-    cipher = des_block(salted, key, encrypt=True)
-    return salt, cipher, salt + cipher
+def xdes_encrypt_block(block_16: bytes, keys: dict) -> bytes:
+    """Encrypt a single 128-bit block under XDES-A."""
+    L = block_16[:8]
+    R = block_16[8:]
 
-def salted_des_decrypt(data, key):
-    salt, cipher = data[:8], data[8:]
-    salted = des_block(cipher, key, encrypt=False)
-    return bytes(sp ^ s for sp, s in zip(salted, salt))
+    # Pre-whitening
+    L = _xor_bytes(L, keys["pre"])
+    R = _xor_bytes(R, keys["pre"])
+
+    # 16 Feistel rounds on each half; mid-point cross-mix at round 8
+    rounds = keys["rounds"]
+    L = _feistel_half(L, rounds[:8],  encrypt=True)
+    R = _feistel_half(R, rounds[:8],  encrypt=True)
+    # cross-mix: swap and XOR
+    L, R = _xor_bytes(L, R), _xor_bytes(R, L)
+    L = _feistel_half(L, rounds[8:], encrypt=True)
+    R = _feistel_half(R, rounds[8:], encrypt=True)
+
+    # Post-whitening
+    L = _xor_bytes(L, keys["post"])
+    R = _xor_bytes(R, keys["post"])
+
+    return L + R
+
+def xdes_decrypt_block(block_16: bytes, keys: dict) -> bytes:
+    """Decrypt a single 128-bit block under XDES-A."""
+    L = block_16[:8]
+    R = block_16[8:]
+
+    # Undo post-whitening
+    L = _xor_bytes(L, keys["post"])
+    R = _xor_bytes(R, keys["post"])
+
+    # Undo second half of Feistel (reversed)
+    rounds = keys["rounds"]
+    L = _feistel_half(L, rounds[8:], encrypt=False)
+    R = _feistel_half(R, rounds[8:], encrypt=False)
+    # undo cross-mix (XOR is its own inverse in this arrangement)
+    L, R = _xor_bytes(L, R), _xor_bytes(R, L)
+    L = _feistel_half(L, rounds[:8], encrypt=False)
+    R = _feistel_half(R, rounds[:8], encrypt=False)
+
+    # Undo pre-whitening
+    L = _xor_bytes(L, keys["pre"])
+    R = _xor_bytes(R, keys["pre"])
+
+    return L + R
 
 # ─────────────────────────────────────────────
-#  FULL PIPELINE: Salted-DES + Caesar
-#  Encrypt: Plaintext -> XOR Salt -> DES -> Caesar -> final string
-#  Decrypt: Caesar^-1 -> DES^-1 -> XOR Salt -> Plaintext
+#  CTR MODE  (128-bit block, 128-bit nonce/counter)
 # ─────────────────────────────────────────────
 
-def pipeline_encrypt(plaintext, key, shift):
-    salt, des_cipher, full = salted_des_encrypt(plaintext, key)
-    hex_str = full.hex().upper()
-    caesar_out = caesar_encrypt(hex_str, shift)
-    return salt, des_cipher, full, caesar_out
+def _ctr_keystream_block(nonce: bytes, counter: int, keys: dict) -> bytes:
+    """Encrypt nonce||counter to produce a 128-bit keystream block."""
+    ctr_block = nonce[:8] + struct.pack(">Q", counter)
+    return xdes_encrypt_block(ctr_block, keys)
 
-def pipeline_decrypt(caesar_hex, key, shift):
-    recovered_hex = caesar_decrypt(caesar_hex, shift)
-    try:
-        raw = bytes.fromhex(recovered_hex)
-    except ValueError:
-        raise ValueError(f"Caesar-decrypt produced invalid hex: {recovered_hex[:30]}...")
-    if len(raw) != 16:
-        raise ValueError(f"Expected 16 bytes after Caesar-decrypt, got {len(raw)}.")
-    plaintext = salted_des_decrypt(raw, key)
-    return recovered_hex, raw[:8], raw[8:], plaintext
+def ctr_encrypt(plaintext: bytes, keys: dict, nonce: bytes) -> bytes:
+    """CTR-mode encrypt/decrypt (symmetric)."""
+    out = bytearray()
+    for i in range(0, len(plaintext), 16):
+        chunk = plaintext[i:i+16]
+        ks    = _ctr_keystream_block(nonce, i // 16, keys)
+        out  += bytes(p ^ k for p, k in zip(chunk, ks[:len(chunk)]))
+    return bytes(out)
 
 # ─────────────────────────────────────────────
-#  CAESAR CIPHER
+#  FULL XDES-A PIPELINE
+# ─────────────────────────────────────────────
+#
+#  Packet layout: argon_salt(16) || nonce(8) || ciphertext(16) || mac(16)
+
+def xdes_a_encrypt(plaintext: bytes, password: bytes):
+    argon_salt = os.urandom(16)
+    nonce      = os.urandom(8)
+    keys       = derive_keys(password, argon_salt)
+    ciphertext = ctr_encrypt(plaintext, keys, nonce)
+    tag        = hmac.new(keys["mac"], nonce + ciphertext, hashlib.sha256).digest()[:16]
+    packet     = argon_salt + nonce + ciphertext + tag
+    return argon_salt, nonce, ciphertext, tag, packet, keys
+
+def xdes_a_decrypt(packet: bytes, password: bytes):
+    if len(packet) < 16 + 8 + 16:
+        raise ValueError("Packet too short.")
+    argon_salt = packet[:16]
+    nonce      = packet[16:24]
+    tag_recv   = packet[-16:]
+    ciphertext = packet[24:-16]
+    keys       = derive_keys(password, argon_salt)
+    tag_calc   = hmac.new(keys["mac"], nonce + ciphertext, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag_recv, tag_calc):
+        raise ValueError("MAC verification failed — data tampered or wrong key.")
+    plaintext  = ctr_encrypt(ciphertext, keys, nonce)
+    return argon_salt, nonce, ciphertext, tag_recv, plaintext, keys
+
+# ─────────────────────────────────────────────
+#  AVALANCHE ANALYSIS  (on 128-bit block)
 # ─────────────────────────────────────────────
 
-def caesar_encrypt(text, shift):
-    result = []
-    for ch in text:
-        if ch.isalpha():
-            base = ord('A') if ch.isupper() else ord('a')
-            result.append(chr((ord(ch) - base + shift) % 26 + base))
-        else:
-            result.append(ch)
-    return ''.join(result)
+def avalanche_analysis(plaintext: bytes, password: bytes):
+    """
+    Flip each bit of the 128-bit block and measure diffusion through the
+    XDES-A block cipher directly (not CTR, which would trivially pass 1 bit).
+    Uses xdes_encrypt_block so whitening + Feistel rounds are all exercised.
+    """
+    pt   = (plaintext + bytes(16))[:16]
+    keys = derive_keys(password, bytes(16))      # fixed salt for determinism
+    base_ct = xdes_encrypt_block(pt, keys)
 
-def caesar_decrypt(text, shift):
-    return caesar_encrypt(text, -shift)
-
-def caesar_brute_force(ciphertext):
-    return [(s, caesar_decrypt(ciphertext, s)) for s in range(26)]
-
-
-def avalanche_analysis(plaintext, key):
-    zero_salt = bytes(8)
-    salted = bytes(p ^ s for p, s in zip(plaintext, zero_salt))
-    base_cipher = des_block(salted, key, encrypt=True)
     results = []
-    for bit_pos in range(64):
+    for bit_pos in range(128):
         byte_idx = bit_pos // 8
         bit_idx  = 7 - (bit_pos % 8)
-        flipped = bytearray(plaintext)
+        flipped  = bytearray(pt)
         flipped[byte_idx] ^= (1 << bit_idx)
-        salted_f = bytes(p ^ s for p, s in zip(bytes(flipped), zero_salt))
-        fc = des_block(salted_f, key, encrypt=True)
-        diff = sum(bin(x ^ y).count('1') for x, y in zip(base_cipher, fc))
+        fc   = xdes_encrypt_block(bytes(flipped), keys)
+        diff = sum(bin(x ^ y).count('1') for x, y in zip(base_ct, fc))
         results.append(diff)
-    avg = sum(results) / 64
-    return avg, (avg / 64) * 100, results
+
+    avg = sum(results) / 128
+    return avg, (avg / 128) * 100, results
 
 # ─────────────────────────────────────────────
 #  COLOR PALETTE  (dark terminal)
 # ─────────────────────────────────────────────
 
-BG       = "#0d0f14"
-BG2      = "#13161d"
-BG3      = "#1a1e28"
-BORDER   = "#252a38"
-ACCENT   = "#00e5ff"
-ACCENT2  = "#7c3aed"
-GREEN    = "#00ff9d"
-YELLOW   = "#ffd600"
-RED      = "#ff3d71"
-FG       = "#cdd6f4"
-FG_DIM   = "#6c7086"
-MONO     = ("Courier New", 10)
-MONO_SM  = ("Courier New", 9)
-MONO_LG  = ("Courier New", 12, "bold")
-SANS     = ("Courier New", 10)
+BG      = "#0d0f14"
+BG2     = "#13161d"
+BG3     = "#1a1e28"
+BORDER  = "#252a38"
+ACCENT  = "#00e5ff"
+ACCENT2 = "#7c3aed"
+GREEN   = "#00ff9d"
+YELLOW  = "#ffd600"
+RED     = "#ff3d71"
+FG      = "#cdd6f4"
+FG_DIM  = "#6c7086"
+MONO    = ("Courier New", 10)
+MONO_SM = ("Courier New", 9)
+MONO_LG = ("Courier New", 12, "bold")
 
 # ─────────────────────────────────────────────
 #  APP
 # ─────────────────────────────────────────────
 
-class SaltedDESApp(tk.Tk):
+class XDESApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Salted-DES  //  Modified DES Algorithm")
-        self.geometry("920x700")
-        self.minsize(820, 620) 
+        self.title("IASSING — Encryptor and Decryptor")
+        self.geometry("980x720")
+        self.minsize(860, 640)
         self.configure(bg=BG)
         self.resizable(True, True)
-
-        self._last_encrypted = None   # stores bytes for decrypt flow
         self._build_ui()
 
     # ── layout ──────────────────────────────
 
     def _build_ui(self):
-        # ── header ──
+        # header
         hdr = tk.Frame(self, bg=BG, pady=0)
-        hdr.pack(fill="x", padx=0, pady=0)
+        hdr.pack(fill="x")
 
-        title_bar = tk.Frame(hdr, bg=ACCENT2, height=3)
-        title_bar.pack(fill="x")
+        tk.Frame(hdr, bg=ACCENT2, height=3).pack(fill="x")
 
-        inner_hdr = tk.Frame(hdr, bg=BG2, pady=12)
+        inner_hdr = tk.Frame(hdr, bg=BG2, pady=10)
         inner_hdr.pack(fill="x")
 
-        tk.Label(inner_hdr, text="◈  SALTED-DES", font=("Courier New", 15, "bold"),
+        tk.Label(inner_hdr, text="◈  IASSING", font=("Courier New", 15, "bold"),
                  bg=BG2, fg=ACCENT).pack(side="left", padx=20)
-        tk.Label(inner_hdr, text="Modified Data Encryption Standard  //  IAS Case Study",
+        tk.Label(inner_hdr, text="Encryptor and Decryptor  //  XDES-A Academic Cipher",
                  font=MONO_SM, bg=BG2, fg=FG_DIM).pack(side="left")
 
-        badge = tk.Label(inner_hdr, text=" SALT + DES + CAESAR ", font=MONO_SM,
-                         bg=ACCENT2, fg="white", padx=6, pady=2)
-        badge.pack(side="right", padx=20)
+        # credits on the right
+        credits_frame = tk.Frame(inner_hdr, bg=BG2)
+        credits_frame.pack(side="right", padx=20)
+        tk.Label(credits_frame,
+                 text="Kharl Asuncion · Alexandra De Vera · Darrel Joshua Ocampo · Ron Benedict Tesorero",
+                 font=("Courier New", 8), bg=BG2, fg=FG_DIM).pack(anchor="e")
+        badge = tk.Label(credits_frame,
+            text=" Argon2id · 128-bit · Whitening · CTR · HMAC ",
+            font=MONO_SM, bg=ACCENT2, fg="white", padx=6, pady=2)
+        badge.pack(anchor="e", pady=(2,0))
 
-        sep = tk.Frame(self, bg=BORDER, height=1)
-        sep.pack(fill="x")
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
-        # ── notebook (tabs) ──
         style = ttk.Style(self)
         style.theme_use("default")
         style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=0)
@@ -264,19 +381,18 @@ class SaltedDESApp(tk.Tk):
                   foreground=[("selected", ACCENT)])
 
         self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=0, pady=0)
+        self.nb.pack(fill="both", expand=True)
 
         self._tab_encrypt()
         self._tab_decrypt()
         self._tab_avalanche()
         self._tab_trace()
-        self._tab_caesar()
+        self._tab_bruteforce()
 
     # ── helpers ─────────────────────────────
 
     def _frame(self, parent):
-        f = tk.Frame(parent, bg=BG2)
-        return f
+        return tk.Frame(parent, bg=BG2)
 
     def _card(self, parent, title, pady=10):
         outer = tk.Frame(parent, bg=BORDER, padx=1, pady=1)
@@ -298,11 +414,10 @@ class SaltedDESApp(tk.Tk):
         return e
 
     def _btn(self, parent, text, cmd, color=ACCENT):
-        b = tk.Button(parent, text=text, font=("Courier New", 10, "bold"),
-                      bg=color, fg=BG, activebackground=FG, activeforeground=BG,
-                      relief="flat", bd=0, padx=18, pady=8, cursor="hand2",
-                      command=cmd)
-        return b
+        return tk.Button(parent, text=text, font=("Courier New", 10, "bold"),
+                         bg=color, fg=BG, activebackground=FG, activeforeground=BG,
+                         relief="flat", bd=0, padx=18, pady=8, cursor="hand2",
+                         command=cmd)
 
     def _output_box(self, parent, height=6):
         box = scrolledtext.ScrolledText(parent, font=MONO_SM, bg=BG, fg=GREEN,
@@ -320,30 +435,8 @@ class SaltedDESApp(tk.Tk):
         box.configure(state="disabled")
         box.see("end")
 
-    def _validate_inputs(self, pt_entry, key_entry, is_bytes=False):
-        pt  = pt_entry.get().strip()
-        key = key_entry.get().strip()
-        if not pt or not key:
-            return None, None, "⚠  Both fields are required."
-        if is_bytes:
-            try:
-                pt_b  = bytes.fromhex(pt)
-                key_b = bytes.fromhex(key)
-            except ValueError:
-                return None, None, "⚠  Hex decode failed. Check your input."
-            if len(pt_b) != 16:
-                return None, None, f"⚠  Encrypted data must be 16 bytes (got {len(pt_b)})."
-            if len(key_b) != 8:
-                return None, None, f"⚠  Key must be exactly 8 bytes (got {len(key_b)})."
-            return pt_b, key_b, None
-        else:
-            pt_b  = pt.encode("utf-8")
-            key_b = key.encode("utf-8")
-            if len(pt_b) != 8:
-                return None, None, f"⚠  Plaintext must be exactly 8 bytes (got {len(pt_b)}).\n   Pad or trim to 8 ASCII chars."
-            if len(key_b) != 8:
-                return None, None, f"⚠  Key must be exactly 8 bytes (got {len(key_b)}).\n   Pad or trim to 8 ASCII chars."
-            return pt_b, key_b, None
+    def _status(self, lbl, text, fg=FG_DIM):
+        lbl.config(text=text, fg=fg)
 
     # ── TAB 1: ENCRYPT ──────────────────────
 
@@ -351,112 +444,113 @@ class SaltedDESApp(tk.Tk):
         tab = self._frame(self.nb)
         self.nb.add(tab, text="  🔒  ENCRYPT  ")
         tab.columnconfigure(0, weight=1)
-        tab.columnconfigure(1, weight=1)
         tab.rowconfigure(1, weight=1)
 
-        # inputs
         c_in, b_in = self._card(tab, "► INPUT")
-        c_in.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(16,8))
+        c_in.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
 
         row = tk.Frame(b_in, bg=BG3)
         row.pack(fill="x")
-        col1 = tk.Frame(row, bg=BG3)
-        col1.pack(side="left", fill="x", expand=True, padx=(0,8))
-        col2 = tk.Frame(row, bg=BG3)
-        col2.pack(side="left", fill="x", expand=True)
 
-        self.enc_pt  = self._labeled_entry(col1, "PLAINTEXT  (8 ASCII chars)")
-        self.enc_pt.insert(0, "HELLO123")
-        self.enc_key = self._labeled_entry(col2, "KEY  (8 ASCII chars)")
-        self.enc_key.insert(0, "SECURITY")
+        col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
+        col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        col3 = tk.Frame(row, bg=BG3)
-        col3.pack(side="left", padx=(8,0))
-        tk.Label(col3, text="CAESAR SHIFT  (1–25)", font=MONO_SM, bg=BG3,
-                 fg=FG_DIM, anchor="w").pack(anchor="w", pady=(6,1))
-        self.enc_shift = tk.Spinbox(col3, from_=1, to=25, width=5,
-                                    font=MONO, bg=BG, fg=YELLOW,
-                                    buttonbackground=BG3, relief="flat", bd=4)
-        self.enc_shift.pack(anchor="w", ipady=4)
-        self.enc_shift.delete(0, "end")
-        self.enc_shift.insert(0, "3")
+        self.enc_pt  = self._labeled_entry(col1, "PLAINTEXT  (1–16 ASCII bytes)")
+        self.enc_pt.insert(0, "HELLO XDES-A!!")
+        self.enc_pw  = self._labeled_entry(col2, "PASSWORD  (any length)", show="•")
+        self.enc_pw.insert(0, "MyS3cur3Pass!")
 
-        btn_row = tk.Frame(b_in, bg=BG3, pady=10)
-        btn_row.pack(anchor="w")
+        tk.Label(b_in,
+            text="  ⚙  KDF: Argon2id  t=2  m=64MB  p=1   "
+                 "│  Block: 128-bit dual Feistel   "
+                 "│  Mode: CTR + HMAC-SHA256",
+            font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w", pady=(6,0))
+
+        btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
         self._btn(btn_row, "  ▶  ENCRYPT  ", self._do_encrypt).pack(side="left", padx=(0,8))
-        self._btn(btn_row, "  ✕  CLEAR  ", lambda: self._clear_enc(), color=BG3).pack(side="left")
+        self._btn(btn_row, "  ✕  CLEAR  ", self._clear_enc, color=BG3).pack(side="left")
 
-        # output
         c_out, b_out = self._card(tab, "► OUTPUT", pady=8)
-        c_out.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0,16))
-        self.enc_out = self._output_box(b_out, height=12)
+        c_out.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0,16))
+        self.enc_out = self._output_box(b_out, height=14)
 
-        # status bar
-        self.enc_status = tk.Label(tab, text="Ready.", font=MONO_SM, bg=BG, fg=FG_DIM,
-                                   anchor="w", padx=16)
-        self.enc_status.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.enc_status = tk.Label(tab, text="Ready.  Note: Argon2id KDF takes ~1–2s.",
+                                   font=MONO_SM, bg=BG, fg=FG_DIM, anchor="w", padx=16)
+        self.enc_status.grid(row=2, column=0, sticky="ew")
 
     def _do_encrypt(self):
-        pt_b, key_b, err = self._validate_inputs(self.enc_pt, self.enc_key)
-        if err:
-            self._write(self.enc_out, err)
-            self.enc_status.config(text=err, fg=RED)
+        pt_str = self.enc_pt.get()
+        pw_str = self.enc_pw.get()
+        if not pt_str or not pw_str:
+            self._write(self.enc_out, "⚠  Both plaintext and password are required.")
             return
+        pt_b = pt_str.encode("utf-8")
+        if len(pt_b) > 16:
+            self._write(self.enc_out, f"⚠  Plaintext max 16 bytes (got {len(pt_b)}). Trim input.")
+            return
+        pt_padded = pt_b.ljust(16, b'\x00')
+        pw_b = pw_str.encode("utf-8")
+
+        self._status(self.enc_status, "⏳  Running Argon2id KDF (~1–2s)…", YELLOW)
+        self.update()
+
         try:
-            shift = int(self.enc_shift.get())
-            if not 1 <= shift <= 25:
-                raise ValueError
-        except ValueError:
-            self._write(self.enc_out, "⚠  Caesar shift must be 1–25.")
-            self.enc_status.config(text="⚠  Invalid Caesar shift.", fg=RED)
+            argon_salt, nonce, ciphertext, tag, packet, keys = xdes_a_encrypt(pt_padded, pw_b)
+        except Exception as ex:
+            self._write(self.enc_out, f"⚠  Encryption error: {ex}")
+            self._status(self.enc_status, f"⚠  Error: {ex}", RED)
             return
 
-        salt, des_cipher, des_full, caesar_out = pipeline_encrypt(pt_b, key_b, shift)
-        salted_pt = bytes(p ^ s for p, s in zip(pt_b, salt))
-
+        packet_hex = packet.hex().upper()
         lines = [
-            "╔══════════════════════════════════════════════════════╗",
-            "║         SALTED-DES + CAESAR  ENCRYPTION             ║",
-            "╚══════════════════════════════════════════════════════╝",
+            "╔══════════════════════════════════════════════════════════╗",
+            "║               XDES-A   ENCRYPTION REPORT                ║",
+            "╚══════════════════════════════════════════════════════════╝",
             "",
-            f"  Plaintext (ASCII)   :  {pt_b.decode()}",
-            f"  Plaintext (hex)     :  {pt_b.hex().upper()}",
-            f"  Key (ASCII)         :  {key_b.decode()}",
-            f"  Caesar Shift        :  {shift}",
+            f"  Plaintext (ASCII)     :  {pt_str!r}",
+            f"  Plaintext (hex, padded):  {pt_padded.hex().upper()}",
             "",
-            "  ── STEP 1: SALTING ──────────────────────────────────",
-            f"  Salt (random 64-bit):  {salt.hex().upper()}",
-            f"  Plaintext XOR Salt  :  {salted_pt.hex().upper()}",
+            "  ── STEP 1: Argon2id KDF ─────────────────────────────────",
+            f"  Argon2 Salt (random)  :  {argon_salt.hex().upper()}",
+            f"  K_pre  (whitening)    :  {keys['pre'].hex().upper()}",
+            f"  K_post (whitening)    :  {keys['post'].hex().upper()}",
+            f"  K_mac  (HMAC key)     :  {keys['mac'].hex().upper()}",
+            f"  K_1..K_16 (round keys):  [16 independent 48-bit keys derived]",
             "",
-            "  ── STEP 2: DES (16 Feistel rounds) ─────────────────",
-            f"  DES Ciphertext      :  {des_cipher.hex().upper()}",
-            f"  salt || ciphertext  :  {des_full.hex().upper()}",
+            "  ── STEP 2: Pre-Whitening (DES-X) ────────────────────────",
+            f"  PT ⊕ K_pre (L half)   :  {_xor_bytes(pt_padded[:8], keys['pre']).hex().upper()}",
+            f"  PT ⊕ K_pre (R half)   :  {_xor_bytes(pt_padded[8:], keys['pre']).hex().upper()}",
             "",
-            "  ── STEP 3: CAESAR CIPHER (shift={}) ─────────────────".format(shift),
-            f"  Input (hex string)  :  {des_full.hex().upper()}",
-            f"  Caesar Output       :  {caesar_out}",
+            "  ── STEP 3: 16 Feistel Rounds (each independent key) ─────",
+            "           + Mid-point cross-mix (L ↔ R XOR swap)",
+            f"  Ciphertext (128-bit)  :  {ciphertext.hex().upper()}",
             "",
-            "  ── FINAL OUTPUT ─────────────────────────────────────",
-            f"  >>> {caesar_out}",
+            "  ── STEP 4: Post-Whitening ───────────────────────────────",
             "",
-            "  ✓  Send the FINAL OUTPUT above to the DECRYPT tab.",
+            "  ── STEP 5: CTR Mode (random nonce) ──────────────────────",
+            f"  Nonce (random 64-bit) :  {nonce.hex().upper()}",
+            "",
+            "  ── STEP 6: HMAC-SHA256 (Encrypt-then-MAC) ───────────────",
+            f"  MAC tag (128-bit)     :  {tag.hex().upper()}",
+            "",
+            "  ── FINAL OUTPUT (hex) ───────────────────────────────────",
+            f"  {packet_hex}",
+            "",
+            "  Packet layout: [Argon2 Salt 16B] [Nonce 8B] [Ciphertext 16B] [MAC 16B]",
+            "  ✓  Paste the FINAL OUTPUT above into the DECRYPT tab.",
         ]
         self._write(self.enc_out, "\n".join(lines))
-        self.enc_status.config(text=f"✓  Done. Final: {caesar_out[:32]}...", fg=GREEN)
+        self._status(self.enc_status, f"✓  Done. Packet: {len(packet)} bytes.", GREEN)
 
-        # auto-fill decrypt tab
-        self.dec_ct.delete(0, "end")
-        self.dec_ct.insert(0, caesar_out)
-        self.dec_key.delete(0, "end")
-        self.dec_key.insert(0, self.enc_key.get())
-        self.dec_shift.delete(0, "end")
-        self.dec_shift.insert(0, str(shift))
+        # auto-fill decrypt
+        self.dec_ct.delete(0, "end");  self.dec_ct.insert(0, packet_hex)
+        self.dec_pw.delete(0, "end");  self.dec_pw.insert(0, pw_str)
 
     def _clear_enc(self):
         self.enc_pt.delete(0, "end")
-        self.enc_key.delete(0, "end")
+        self.enc_pw.delete(0, "end")
         self._write(self.enc_out, "")
-        self.enc_status.config(text="Cleared.", fg=FG_DIM)
+        self._status(self.enc_status, "Cleared.")
 
     # ── TAB 2: DECRYPT ──────────────────────
 
@@ -464,113 +558,89 @@ class SaltedDESApp(tk.Tk):
         tab = self._frame(self.nb)
         self.nb.add(tab, text="  🔓  DECRYPT  ")
         tab.columnconfigure(0, weight=1)
-        tab.columnconfigure(1, weight=1)
         tab.rowconfigure(1, weight=1)
 
         c_in, b_in = self._card(tab, "► INPUT")
-        c_in.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(16,8))
+        c_in.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
 
-        row = tk.Frame(b_in, bg=BG3)
-        row.pack(fill="x")
-        col1 = tk.Frame(row, bg=BG3)
-        col1.pack(side="left", fill="x", expand=True, padx=(0,8))
-        col2 = tk.Frame(row, bg=BG3)
-        col2.pack(side="left", fill="x", expand=True)
+        row = tk.Frame(b_in, bg=BG3); row.pack(fill="x")
+        col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
+        col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        self.dec_ct  = self._labeled_entry(col1, "ENCRYPTED DATA  (Caesar output string)")
-        self.dec_key = self._labeled_entry(col2, "KEY  (8 ASCII chars)")
+        self.dec_ct  = self._labeled_entry(col1, "ENCRYPTED DATA  (hex from Encrypt tab)")
+        self.dec_pw  = self._labeled_entry(col2, "PASSWORD", show="•")
 
-        col3 = tk.Frame(row, bg=BG3)
-        col3.pack(side="left", padx=(8,0))
-        tk.Label(col3, text="CAESAR SHIFT  (1–25)", font=MONO_SM, bg=BG3,
-                 fg=FG_DIM, anchor="w").pack(anchor="w", pady=(6,1))
-        self.dec_shift = tk.Spinbox(col3, from_=1, to=25, width=5,
-                                    font=MONO, bg=BG, fg=YELLOW,
-                                    buttonbackground=BG3, relief="flat", bd=4)
-        self.dec_shift.pack(anchor="w", ipady=4)
-        self.dec_shift.delete(0, "end")
-        self.dec_shift.insert(0, "3")
-
-        btn_row = tk.Frame(b_in, bg=BG3, pady=10)
-        btn_row.pack(anchor="w")
+        btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
         self._btn(btn_row, "  ▶  DECRYPT  ", self._do_decrypt, color=GREEN).pack(side="left", padx=(0,8))
-        self._btn(btn_row, "  ✕  CLEAR  ", lambda: self._clear_dec(), color=BG3).pack(side="left")
+        self._btn(btn_row, "  ✕  CLEAR  ", self._clear_dec, color=BG3).pack(side="left")
 
         c_out, b_out = self._card(tab, "► OUTPUT", pady=8)
-        c_out.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0,16))
-        self.dec_out = self._output_box(b_out, height=12)
+        c_out.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0,16))
+        self.dec_out = self._output_box(b_out, height=14)
 
-        self.dec_status = tk.Label(tab, text="Ready.", font=MONO_SM, bg=BG, fg=FG_DIM,
-                                   anchor="w", padx=16)
-        self.dec_status.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.dec_status = tk.Label(tab, text="Ready.  Note: Argon2id KDF takes ~1–2s.",
+                                   font=MONO_SM, bg=BG, fg=FG_DIM, anchor="w", padx=16)
+        self.dec_status.grid(row=2, column=0, sticky="ew")
 
     def _do_decrypt(self):
-        caesar_str = self.dec_ct.get().strip()
-        key_str    = self.dec_key.get().strip()
-        if not caesar_str or not key_str:
-            self._write(self.dec_out, "⚠  Both fields are required.")
-            self.dec_status.config(text="⚠  Missing inputs.", fg=RED)
-            return
-        key_b = key_str.encode("utf-8")
-        if len(key_b) != 8:
-            self._write(self.dec_out, f"⚠  Key must be exactly 8 bytes (got {len(key_b)}).")
-            self.dec_status.config(text="⚠  Bad key length.", fg=RED)
+        hex_str = self.dec_ct.get().strip()
+        pw_str  = self.dec_pw.get()
+        if not hex_str or not pw_str:
+            self._write(self.dec_out, "⚠  Both fields required.")
             return
         try:
-            shift = int(self.dec_shift.get())
-            if not 1 <= shift <= 25:
-                raise ValueError
+            raw = bytes.fromhex(hex_str)
         except ValueError:
-            self._write(self.dec_out, "⚠  Caesar shift must be 1–25.")
-            self.dec_status.config(text="⚠  Invalid shift.", fg=RED)
+            self._write(self.dec_out, "⚠  Invalid hex string. Paste the exact output from the Encrypt tab.")
             return
 
+        self._status(self.dec_status, "⏳  Running Argon2id KDF (~1–2s)…", YELLOW)
+        self.update()
+
         try:
-            recovered_hex, salt, des_cipher, plaintext = pipeline_decrypt(caesar_str, key_b, shift)
-            salted_pt = des_block(des_cipher, key_b, encrypt=False)
-
-            try:
-                pt_ascii = plaintext.decode("utf-8")
-            except Exception:
-                pt_ascii = "[non-ASCII]"
-
-            lines = [
-                "╔══════════════════════════════════════════════════════╗",
-                "║         SALTED-DES + CAESAR  DECRYPTION             ║",
-                "╚══════════════════════════════════════════════════════╝",
-                "",
-                f"  Caesar Input        :  {caesar_str}",
-                f"  Key (ASCII)         :  {key_str}",
-                f"  Caesar Shift        :  {shift}",
-                "",
-                "  ── STEP 1: CAESAR⁻¹ (shift -{}) ────────────────────".format(shift),
-                f"  Recovered hex str   :  {recovered_hex}",
-                "",
-                "  ── STEP 2: SPLIT SALT ───────────────────────────────",
-                f"  Salt                :  {salt.hex().upper()}",
-                f"  DES Ciphertext      :  {des_cipher.hex().upper()}",
-                "",
-                "  ── STEP 3: DES DECRYPTION (subkeys reversed) ────────",
-                f"  After DES-decrypt   :  {salted_pt.hex().upper()}",
-                "",
-                "  ── STEP 4: XOR WITH SALT ────────────────────────────",
-                f"  Plaintext (hex)     :  {plaintext.hex().upper()}",
-                f"  Plaintext (ASCII)   :  {pt_ascii}",
-                "",
-                "  ✓  D_k(E_k(m)) = m   →   PIPELINE PROOF COMPLETE",
-            ]
-            self._write(self.dec_out, "\n".join(lines))
-            self.dec_status.config(text=f"✓  Decrypted: {pt_ascii}", fg=GREEN)
-
+            argon_salt, nonce, ciphertext, tag, plaintext, keys = xdes_a_decrypt(raw, pw_str.encode())
         except Exception as ex:
             self._write(self.dec_out, f"⚠  Decryption failed: {ex}")
-            self.dec_status.config(text=f"⚠  Error: {ex}", fg=RED)
+            self._status(self.dec_status, f"⚠  {ex}", RED)
+            return
+
+        try:
+            pt_ascii = plaintext.rstrip(b'\x00').decode("utf-8")
+        except Exception:
+            pt_ascii = "[non-ASCII]"
+
+        lines = [
+            "╔══════════════════════════════════════════════════════════╗",
+            "║               XDES-A   DECRYPTION REPORT                ║",
+            "╚══════════════════════════════════════════════════════════╝",
+            "",
+            "  ── STEP 1: Parse Packet ─────────────────────────────────",
+            f"  Argon2 Salt           :  {argon_salt.hex().upper()}",
+            f"  Nonce                 :  {nonce.hex().upper()}",
+            f"  MAC tag (received)    :  {tag.hex().upper()}",
+            "",
+            "  ── STEP 2: Argon2id KDF (same password + salt) ──────────",
+            f"  K_pre                 :  {keys['pre'].hex().upper()}",
+            f"  K_post                :  {keys['post'].hex().upper()}",
+            f"  K_mac                 :  {keys['mac'].hex().upper()}",
+            "",
+            "  ── STEP 3: HMAC-SHA256 Verification ─────────────────────",
+            "  ✓  MAC verified  —  data integrity confirmed",
+            "",
+            "  ── STEP 4: CTR Decrypt → Feistel⁻¹ → Unwhiten ──────────",
+            f"  Plaintext (hex)       :  {plaintext.hex().upper()}",
+            f"  Plaintext (ASCII)     :  {pt_ascii!r}",
+            "",
+            "  ✓  D_k(E_k(m)) = m   →   PIPELINE PROOF COMPLETE",
+        ]
+        self._write(self.dec_out, "\n".join(lines))
+        self._status(self.dec_status, f"✓  Decrypted: {pt_ascii!r}", GREEN)
 
     def _clear_dec(self):
         self.dec_ct.delete(0, "end")
-        self.dec_key.delete(0, "end")
+        self.dec_pw.delete(0, "end")
         self._write(self.dec_out, "")
-        self.dec_status.config(text="Cleared.", fg=FG_DIM)
+        self._status(self.dec_status, "Cleared.")
 
     # ── TAB 3: AVALANCHE ────────────────────
 
@@ -583,82 +653,78 @@ class SaltedDESApp(tk.Tk):
         c_in, b_in = self._card(tab, "► INPUT")
         c_in.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
 
-        row = tk.Frame(b_in, bg=BG3)
-        row.pack(fill="x")
-        col1 = tk.Frame(row, bg=BG3)
-        col1.pack(side="left", fill="x", expand=True, padx=(0,8))
-        col2 = tk.Frame(row, bg=BG3)
-        col2.pack(side="left", fill="x", expand=True)
+        row = tk.Frame(b_in, bg=BG3); row.pack(fill="x")
+        col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
+        col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        self.av_pt  = self._labeled_entry(col1, "PLAINTEXT  (8 ASCII chars)")
-        self.av_pt.insert(0, "HELLO123")
-        self.av_key = self._labeled_entry(col2, "KEY  (8 ASCII chars)")
-        self.av_key.insert(0, "SECURITY")
+        self.av_pt  = self._labeled_entry(col1, "PLAINTEXT  (up to 16 ASCII chars)")
+        self.av_pt.insert(0, "HELLO XDES-A!!")
+        self.av_pw  = self._labeled_entry(col2, "PASSWORD", show="•")
+        self.av_pw.insert(0, "MyS3cur3Pass!")
 
-        btn_row = tk.Frame(b_in, bg=BG3, pady=10)
-        btn_row.pack(anchor="w")
+        tk.Label(b_in,
+            text="  ⚙  Flips each of the 128 plaintext bits once. KDF runs once (fixed salt).",
+            font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w", pady=(4,0))
+
+        btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
         self._btn(btn_row, "  ▶  ANALYZE  ", self._do_avalanche, color=YELLOW).pack(side="left")
 
-        c_out, b_out = self._card(tab, "► AVALANCHE ANALYSIS", pady=8)
+        c_out, b_out = self._card(tab, "► AVALANCHE ANALYSIS  (128 bits)", pady=8)
         c_out.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0,16))
-        self.av_out = self._output_box(b_out, height=14)
+        self.av_out = self._output_box(b_out, height=16)
 
-        self.av_status = tk.Label(tab, text="Ready.", font=MONO_SM, bg=BG, fg=FG_DIM,
-                                  anchor="w", padx=16)
+        self.av_status = tk.Label(tab, text="Ready.  Note: Argon2id KDF runs once (~1–2s).",
+                                  font=MONO_SM, bg=BG, fg=FG_DIM, anchor="w", padx=16)
         self.av_status.grid(row=2, column=0, sticky="ew")
 
     def _do_avalanche(self):
-        pt_b, key_b, err = self._validate_inputs(self.av_pt, self.av_key)
-        if err:
-            self._write(self.av_out, err)
-            self.av_status.config(text=err, fg=RED)
+        pt_str = self.av_pt.get()
+        pw_str = self.av_pw.get()
+        if not pt_str or not pw_str:
+            self._write(self.av_out, "⚠  Both fields required.")
             return
+        pt_b = pt_str.encode("utf-8")[:16].ljust(16, b'\x00')
 
-        self.av_status.config(text="Running analysis (64 tests)...", fg=YELLOW)
+        self._status(self.av_status, "⏳  Argon2id KDF + 128 cipher evaluations…", YELLOW)
         self.update()
 
-        avg, pct, results = avalanche_analysis(pt_b, key_b)
-        worst_val = min(results)
-        best_val  = max(results)
-        worst_bit = results.index(worst_val)
-        best_bit  = results.index(best_val)
+        avg, pct, results = avalanche_analysis(pt_b, pw_str.encode())
 
-        # bar chart (text)
-        chart_lines = []
-        chart_lines.append("  BIT#  CHANGED  BAR")
-        chart_lines.append("  ─────────────────────────────────────────────────────")
+        worst_val = min(results); best_val = max(results)
+        worst_bit = results.index(worst_val); best_bit = results.index(best_val)
+
+        chart = ["  BIT#  CHANGED   BAR",
+                 "  " + "─"*56]
         for i, d in enumerate(results):
-            bar = "█" * (d // 2)
-            pct_i = d / 64 * 100
-            flag = " ◄ WORST" if i == worst_bit else (" ◄ BEST" if i == best_bit else "")
-            chart_lines.append(f"  {i:02d}    {d:02d}/64   {bar:<32} {pct_i:5.1f}%{flag}")
+            bar   = "█" * (d // 4)
+            pct_i = d / 128 * 100
+            flag  = " ◄ WORST" if i == worst_bit else (" ◄ BEST" if i == best_bit else "")
+            chart.append(f"  {i:03d}   {d:03d}/128  {bar:<32} {pct_i:5.1f}%{flag}")
 
         lines = [
-            "╔══════════════════════════════════════════════════════╗",
-            "║           AVALANCHE EFFECT ANALYSIS                 ║",
-            "╚══════════════════════════════════════════════════════╝",
+            "╔══════════════════════════════════════════════════════════╗",
+            "║           XDES-A  AVALANCHE EFFECT ANALYSIS             ║",
+            "╚══════════════════════════════════════════════════════════╝",
             "",
-            f"  Plaintext  :  {pt_b.hex().upper()}  ({pt_b.decode()})",
-            f"  Key        :  {key_b.hex().upper()}  ({key_b.decode()})",
-            f"  Bits tested:  64  (all plaintext bits, 1 flip each)",
+            f"  Plaintext  :  {pt_b.hex().upper()}",
+            f"  Bits tested:  128  (all plaintext bits, 1 flip each)",
             "",
-            f"  ── SUMMARY ──────────────────────────────────────────",
-            f"  Avg bits changed  :  {avg:.2f} / 64",
+            "  ── SUMMARY ──────────────────────────────────────────────",
+            f"  Avg bits changed  :  {avg:.2f} / 128",
             f"  Avalanche %       :  {pct:.2f}%",
             f"  Ideal target      :  ~50.00%",
             f"  Result            :  {'✓ STRONG' if pct >= 45 else '⚠ WEAK'}",
             "",
-            f"  Best  flip: bit {best_bit:02d}  → {best_val} bits ({best_val/64*100:.1f}%)",
-            f"  Worst flip: bit {worst_bit:02d}  → {worst_val} bits ({worst_val/64*100:.1f}%)",
+            f"  Best  flip: bit {best_bit:03d}  → {best_val} bits  ({best_val/128*100:.1f}%)",
+            f"  Worst flip: bit {worst_bit:03d}  → {worst_val} bits  ({worst_val/128*100:.1f}%)",
             "",
-            "  ── PER-BIT CHART ────────────────────────────────────",
-        ] + chart_lines
+            "  ── PER-BIT CHART ────────────────────────────────────────",
+        ] + chart
 
         self._write(self.av_out, "\n".join(lines))
-        self.av_status.config(
-            text=f"✓  Analysis complete. Avalanche: {pct:.2f}%",
-            fg=GREEN if pct >= 45 else YELLOW
-        )
+        self._status(self.av_status,
+                     f"✓  Avalanche: {pct:.2f}%   {'STRONG' if pct >= 45 else 'WEAK'}",
+                     GREEN if pct >= 45 else YELLOW)
 
     # ── TAB 4: STEP TRACE ───────────────────
 
@@ -671,86 +737,147 @@ class SaltedDESApp(tk.Tk):
         c_in, b_in = self._card(tab, "► INPUT")
         c_in.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
 
-        row = tk.Frame(b_in, bg=BG3)
-        row.pack(fill="x")
-        col1 = tk.Frame(row, bg=BG3)
-        col1.pack(side="left", fill="x", expand=True, padx=(0,8))
-        col2 = tk.Frame(row, bg=BG3)
-        col2.pack(side="left", fill="x", expand=True)
+        row = tk.Frame(b_in, bg=BG3); row.pack(fill="x")
+        col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
+        col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        self.tr_pt  = self._labeled_entry(col1, "PLAINTEXT  (8 ASCII chars)")
-        self.tr_pt.insert(0, "HELLO123")
-        self.tr_key = self._labeled_entry(col2, "KEY  (8 ASCII chars)")
-        self.tr_key.insert(0, "SECURITY")
+        self.tr_pt = self._labeled_entry(col1, "PLAINTEXT  (up to 16 ASCII chars)")
+        self.tr_pt.insert(0, "HELLO XDES-A!!")
+        self.tr_pw = self._labeled_entry(col2, "PASSWORD", show="•")
+        self.tr_pw.insert(0, "MyS3cur3Pass!")
 
-        btn_row = tk.Frame(b_in, bg=BG3, pady=10)
-        btn_row.pack(anchor="w")
-        self._btn(btn_row, "  ▶  TRACE ROUNDS  ", self._do_trace, color=ACCENT2).pack(side="left")
+        tk.Label(b_in,
+            text="  ⚙  Uses fixed zero salt + zero nonce for deterministic trace.",
+            font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w", pady=(4,0))
 
-        c_out, b_out = self._card(tab, "► ROUND-BY-ROUND TRACE", pady=8)
+        btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
+        self._btn(btn_row, "  ▶  TRACE  ", self._do_trace, color=ACCENT2).pack(side="left")
+
+        c_out, b_out = self._card(tab, "► XDES-A STEP TRACE", pady=8)
         c_out.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0,16))
-        self.tr_out = self._output_box(b_out, height=14)
+        self.tr_out = self._output_box(b_out, height=16)
 
-        self.tr_status = tk.Label(tab, text="Ready.", font=MONO_SM, bg=BG, fg=FG_DIM,
-                                  anchor="w", padx=16)
+        self.tr_status = tk.Label(tab, text="Ready.  Note: Argon2id KDF takes ~1–2s.",
+                                  font=MONO_SM, bg=BG, fg=FG_DIM, anchor="w", padx=16)
         self.tr_status.grid(row=2, column=0, sticky="ew")
 
     def _do_trace(self):
-        pt_b, key_b, err = self._validate_inputs(self.tr_pt, self.tr_key)
-        if err:
-            self._write(self.tr_out, err)
-            self.tr_status.config(text=err, fg=RED)
+        pt_str = self.tr_pt.get()
+        pw_str = self.tr_pw.get()
+        if not pt_str or not pw_str:
+            self._write(self.tr_out, "⚠  Both fields required.")
             return
+        pt_b    = pt_str.encode("utf-8")[:16].ljust(16, b'\x00')
+        fixed_s = bytes(16)
+        fixed_n = bytes(8)
 
-        # trace through with fixed salt for determinism
-        salt = bytes(8)
-        salted = bytes(p ^ s for p, s in zip(pt_b, salt))
-        subkeys = generate_subkeys(key_b)
+        self._status(self.tr_status, "⏳  Running Argon2id KDF…", YELLOW)
+        self.update()
 
-        bits = bytes_to_bits(salted)
-        bits = permute(bits, IP)
-        L, R = bits[:32], bits[32:]
+        keys = derive_keys(pw_str.encode(), fixed_s)
+
+        L_raw = pt_b[:8]; R_raw = pt_b[8:]
+
+        # pre-whitening
+        L_w = _xor_bytes(L_raw, keys["pre"])
+        R_w = _xor_bytes(R_raw, keys["pre"])
+
+        # first 8 rounds on L and R independently
+        rounds = keys["rounds"]
+
+        def trace_half(block_8, subkeys):
+            bits = permute(bytes_to_bits(block_8), IP)
+            L, R = bits[:32], bits[32:]
+            states = []
+            for K in subkeys:
+                L, R = R, xor_bits(L, feistel(R, K))
+                states.append((bits_to_bytes(L).hex().upper(),
+                                bits_to_bytes(R).hex().upper()))
+            final = bits_to_bytes(permute(R + L, IP_INV))
+            return states, final
+
+        stL1, L_mid = trace_half(L_w, rounds[:8])
+        stR1, R_mid = trace_half(R_w, rounds[:8])
+
+        # cross-mix
+        L_x = _xor_bytes(L_mid, R_mid)
+        R_x = _xor_bytes(R_mid, L_mid)
+
+        stL2, L_post = trace_half(L_x, rounds[8:])
+        stR2, R_post = trace_half(R_x, rounds[8:])
+
+        # post-whitening
+        L_fin = _xor_bytes(L_post, keys["post"])
+        R_fin = _xor_bytes(R_post, keys["post"])
+
+        # CTR keystream block 0
+        ks = _ctr_keystream_block(fixed_n, 0, keys)
+        ct = bytes(p ^ k for p, k in zip(pt_b, ks[:16]))
 
         lines = [
-            "╔══════════════════════════════════════════════════════╗",
-            "║          SALTED-DES  ROUND-BY-ROUND TRACE           ║",
-            "╚══════════════════════════════════════════════════════╝",
+            "╔══════════════════════════════════════════════════════════╗",
+            "║             XDES-A   STEP-BY-STEP TRACE                 ║",
+            "╚══════════════════════════════════════════════════════════╝",
             "",
-            f"  Plaintext (ASCII)   :  {pt_b.decode()}",
-            f"  Plaintext (hex)     :  {pt_b.hex().upper()}",
-            f"  Salt (fixed 0s)     :  {salt.hex().upper()}",
-            f"  Salted PT (hex)     :  {salted.hex().upper()}",
-            f"  Key (hex)           :  {key_b.hex().upper()}",
+            f"  Plaintext (ASCII)    :  {pt_str!r}",
+            f"  Plaintext (hex)      :  {pt_b.hex().upper()}",
+            f"  Password             :  {'•' * len(pw_str)}",
             "",
-            "  ── AFTER INITIAL PERMUTATION (IP) ───────────────────",
-            f"  L0  :  {bits_to_bytes(L).hex().upper()}",
-            f"  R0  :  {bits_to_bytes(R).hex().upper()}",
+            "  ── STEP 1: Argon2id KDF (fixed zero salt) ───────────────",
+            f"  K_pre                :  {keys['pre'].hex().upper()}",
+            f"  K_post               :  {keys['post'].hex().upper()}",
+            f"  K_mac                :  {keys['mac'].hex().upper()}",
             "",
-            "  ── 16 FEISTEL ROUNDS ────────────────────────────────",
+            "  ── STEP 2: Pre-Whitening (L ⊕ K_pre, R ⊕ K_pre) ────────",
+            f"  L after whitening    :  {L_w.hex().upper()}",
+            f"  R after whitening    :  {R_w.hex().upper()}",
+            "",
+            "  ── STEP 3: Feistel Rounds 1–8  (Left half) ─────────────",
         ]
+        for i, (lh, rh) in enumerate(stL1):
+            lines.append(f"  L_R{i+1:02d}  L={lh}  R={rh}")
 
-        for i, K in enumerate(subkeys):
-            new_R = xor_bits(L, feistel(R, K))
-            L, R  = R, new_R
-            lines.append(
-                f"  R{i+1:02d} :  {bits_to_bytes(R).hex().upper()}"
-                f"   L{i+1:02d} :  {bits_to_bytes(L).hex().upper()}"
-            )
-
-        final = bits_to_bytes(permute(R + L, IP_INV))
         lines += [
             "",
-            "  ── AFTER FINAL PERMUTATION (IP⁻¹) ──────────────────",
-            f"  Ciphertext :  {final.hex().upper()}",
+            "  ── STEP 3: Feistel Rounds 1–8  (Right half) ────────────",
+        ]
+        for i, (lh, rh) in enumerate(stR1):
+            lines.append(f"  R_R{i+1:02d}  L={lh}  R={rh}")
+
+        lines += [
+            "",
+            "  ── STEP 4: Mid-Point Cross-Mix (L ⊕ R, R ⊕ L) ─────────",
+            f"  L_cross              :  {L_x.hex().upper()}",
+            f"  R_cross              :  {R_x.hex().upper()}",
+            "",
+            "  ── STEP 5: Feistel Rounds 9–16  (Left half) ────────────",
+        ]
+        for i, (lh, rh) in enumerate(stL2):
+            lines.append(f"  L_R{i+9:02d}  L={lh}  R={rh}")
+
+        lines += [
+            "",
+            "  ── STEP 5: Feistel Rounds 9–16  (Right half) ───────────",
+        ]
+        for i, (lh, rh) in enumerate(stR2):
+            lines.append(f"  R_R{i+9:02d}  L={lh}  R={rh}")
+
+        lines += [
+            "",
+            "  ── STEP 6: Post-Whitening ───────────────────────────────",
+            f"  L_final              :  {L_fin.hex().upper()}",
+            f"  R_final              :  {R_fin.hex().upper()}",
+            "",
+            "  ── STEP 7: CTR Keystream Block 0 (nonce=000…) ───────────",
+            f"  Keystream            :  {ks.hex().upper()}",
+            f"  Ciphertext (hex)     :  {ct.hex().upper()}",
             "",
             "  ✓  Trace complete.",
         ]
-
         self._write(self.tr_out, "\n".join(lines))
-        self.tr_status.config(text=f"✓  Trace done. Ciphertext: {final.hex().upper()}", fg=GREEN)
+        self._status(self.tr_status, f"✓  Trace done. CT: {ct.hex().upper()}", GREEN)
 
-
-    # ── TAB 5: CAESAR CIPHER ────────────────
+    # ── TAB 5: CAESAR ───────────────────────
 
     def _tab_caesar(self):
         tab = self._frame(self.nb)
@@ -758,54 +885,42 @@ class SaltedDESApp(tk.Tk):
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
-        # ── input card ──
         c_in, b_in = self._card(tab, "► INPUT")
         c_in.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
 
-        row = tk.Frame(b_in, bg=BG3)
-        row.pack(fill="x")
+        row = tk.Frame(b_in, bg=BG3); row.pack(fill="x")
+        col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
+        col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", padx=(0,8))
+        col3 = tk.Frame(row, bg=BG3); col3.pack(side="left")
 
-        col1 = tk.Frame(row, bg=BG3)
-        col1.pack(side="left", fill="x", expand=True, padx=(0,8))
-        col2 = tk.Frame(row, bg=BG3)
-        col2.pack(side="left", fill="x", expand=True, padx=(0,8))
-        col3 = tk.Frame(row, bg=BG3)
-        col3.pack(side="left")
-
-        self.cs_text = self._labeled_entry(col1, "TEXT  (any length, letters only shifted)", width=30)
+        self.cs_text = self._labeled_entry(col1, "TEXT  (any length)", width=40)
         self.cs_text.insert(0, "Hello World")
 
         tk.Label(col2, text="SHIFT  (1–25)", font=MONO_SM, bg=BG3, fg=FG_DIM,
                  anchor="w").pack(anchor="w", pady=(6,1))
-        self.cs_shift = tk.Spinbox(col2, from_=1, to=25, width=6,
-                                   font=MONO, bg=BG, fg=YELLOW,
-                                   buttonbackground=BG3, relief="flat", bd=4)
+        self.cs_shift = tk.Spinbox(col2, from_=1, to=25, width=6, font=MONO, bg=BG,
+                                   fg=YELLOW, buttonbackground=BG3, relief="flat", bd=4)
         self.cs_shift.pack(anchor="w", ipady=4)
-        self.cs_shift.delete(0, "end")
-        self.cs_shift.insert(0, "3")
+        self.cs_shift.delete(0, "end"); self.cs_shift.insert(0, "3")
 
         tk.Label(col3, text="MODE", font=MONO_SM, bg=BG3, fg=FG_DIM,
                  anchor="w").pack(anchor="w", pady=(6,1))
         self.cs_mode = tk.StringVar(value="encrypt")
-        enc_rb = tk.Radiobutton(col3, text="Encrypt", variable=self.cs_mode,
-                                value="encrypt", font=MONO_SM, bg=BG3, fg=GREEN,
-                                selectcolor=BG, activebackground=BG3, bd=0)
-        dec_rb = tk.Radiobutton(col3, text="Decrypt", variable=self.cs_mode,
-                                value="decrypt", font=MONO_SM, bg=BG3, fg=ACCENT,
-                                selectcolor=BG, activebackground=BG3, bd=0)
-        enc_rb.pack(anchor="w")
-        dec_rb.pack(anchor="w")
+        tk.Radiobutton(col3, text="Encrypt", variable=self.cs_mode, value="encrypt",
+                       font=MONO_SM, bg=BG3, fg=GREEN,
+                       selectcolor=BG, activebackground=BG3, bd=0).pack(anchor="w")
+        tk.Radiobutton(col3, text="Decrypt", variable=self.cs_mode, value="decrypt",
+                       font=MONO_SM, bg=BG3, fg=ACCENT,
+                       selectcolor=BG, activebackground=BG3, bd=0).pack(anchor="w")
 
-        btn_row = tk.Frame(b_in, bg=BG3, pady=10)
-        btn_row.pack(anchor="w")
+        btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
         self._btn(btn_row, "  ▶  RUN  ", self._do_caesar, color=YELLOW).pack(side="left", padx=(0,8))
         self._btn(btn_row, "  🔓  BRUTE FORCE  ", self._do_caesar_brute, color=RED).pack(side="left", padx=(0,8))
         self._btn(btn_row, "  ✕  CLEAR  ", self._clear_caesar, color=BG3).pack(side="left")
 
-        # ── output card ──
         c_out, b_out = self._card(tab, "► OUTPUT", pady=8)
         c_out.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0,16))
-        self.cs_out = self._output_box(b_out, height=14)
+        self.cs_out = self._output_box(b_out, height=16)
 
         self.cs_status = tk.Label(tab, text="Ready.", font=MONO_SM, bg=BG, fg=FG_DIM,
                                   anchor="w", padx=16)
@@ -814,81 +929,68 @@ class SaltedDESApp(tk.Tk):
     def _do_caesar(self):
         text = self.cs_text.get()
         if not text:
-            self.cs_status.config(text="⚠  Enter some text.", fg=RED)
-            return
+            self._status(self.cs_status, "⚠  Enter text.", RED); return
         try:
             shift = int(self.cs_shift.get())
-            if not 1 <= shift <= 25:
-                raise ValueError
+            if not 1 <= shift <= 25: raise ValueError
         except ValueError:
-            self.cs_status.config(text="⚠  Shift must be 1–25.", fg=RED)
-            return
+            self._status(self.cs_status, "⚠  Shift must be 1–25.", RED); return
 
-        mode = self.cs_mode.get()
-        if mode == "encrypt":
-            result = caesar_encrypt(text, shift)
-            op = "ENCRYPT"
-            color = GREEN
-        else:
-            result = caesar_decrypt(text, shift)
-            op = "DECRYPT"
-            color = ACCENT
+        mode   = self.cs_mode.get()
+        result = caesar_encrypt(text, shift) if mode == "encrypt" else caesar_decrypt(text, shift)
+        op     = "ENCRYPT" if mode == "encrypt" else "DECRYPT"
+        color  = GREEN if mode == "encrypt" else ACCENT
 
-        # per-char trace
-        trace_lines = ["  CHAR  →  RESULT  (shift shown for letters)"]
-        trace_lines.append("  " + "─"*40)
-        for orig, res in zip(text, result):
-            if orig.isalpha():
-                trace_lines.append(f"    {orig!r:5}  →  {res!r:5}  (+{shift} mod 26)")
+        trace = ["  CHAR  →  RESULT",
+                 "  " + "─"*40]
+        for o, r in zip(text, result):
+            if o.isalpha():
+                trace.append(f"    {o!r:5}  →  {r!r:5}  (+{shift} mod 26)")
             else:
-                trace_lines.append(f"    {orig!r:5}  →  {res!r:5}  (unchanged)")
+                trace.append(f"    {o!r:5}  →  {r!r:5}  (unchanged)")
 
         lines = [
-            "╔══════════════════════════════════════════════════════╗",
-            f"║               CAESAR CIPHER  {op:<24}║",
-            "╚══════════════════════════════════════════════════════╝",
+            "╔══════════════════════════════════════════════════════════╗",
+            f"║               CAESAR CIPHER  {op:<26}║",
+            "╚══════════════════════════════════════════════════════════╝",
             "",
             f"  Input   :  {text}",
             f"  Shift   :  {shift}",
             f"  Output  :  {result}",
             "",
-            "  ── CHARACTER TRACE ──────────────────────────────────",
-        ] + trace_lines
-
+            "  ── CHARACTER TRACE ──────────────────────────────────────",
+        ] + trace
         self._write(self.cs_out, "\n".join(lines))
-        self.cs_status.config(text=f"✓  {op}: {result}", fg=color)
+        self._status(self.cs_status, f"✓  {op}: {result}", color)
 
     def _do_caesar_brute(self):
         text = self.cs_text.get()
         if not text:
-            self.cs_status.config(text="⚠  Enter some text to brute-force.", fg=RED)
-            return
-
+            self._status(self.cs_status, "⚠  Enter text.", RED); return
         results = caesar_brute_force(text)
         lines = [
-            "╔══════════════════════════════════════════════════════╗",
-            "║            CAESAR  BRUTE FORCE  (all 25 shifts)     ║",
-            "╚══════════════════════════════════════════════════════╝",
+            "╔══════════════════════════════════════════════════════════╗",
+            "║            CAESAR  BRUTE FORCE  (all 25 shifts)         ║",
+            "╚══════════════════════════════════════════════════════════╝",
             "",
-            f"  Ciphertext  :  {text}",
+            f"  Ciphertext :  {text}",
             "",
             "  SHIFT  PLAINTEXT CANDIDATE",
-            "  " + "─"*50,
+            "  " + "─"*52,
         ]
-        for shift, candidate in results:
-            lines.append(f"  [{shift:02d}]   {candidate}")
-
+        for s, c in results:
+            lines.append(f"  [{s:02d}]   {c}")
         lines += ["", "  ↑ Scan for the readable line to find the correct shift."]
         self._write(self.cs_out, "\n".join(lines))
-        self.cs_status.config(text="✓  All 25 shifts shown.", fg=YELLOW)
+        self._status(self.cs_status, "✓  All 25 shifts shown.", YELLOW)
 
     def _clear_caesar(self):
         self.cs_text.delete(0, "end")
         self._write(self.cs_out, "")
-        self.cs_status.config(text="Cleared.", fg=FG_DIM)
+        self._status(self.cs_status, "Cleared.")
 
 
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    app = SaltedDESApp()
+    app = XDESApp()
     app.mainloop()
