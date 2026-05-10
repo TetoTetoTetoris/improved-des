@@ -14,10 +14,8 @@ from cipher import (
     derive_keys, _xor_bytes, _feistel_half, _ctr_keystream_block,
     bytes_to_bits, bits_to_bytes, permute, xor_bits, feistel,
     IP, IP_INV, WEAK_PASSWORDS, estimate_crack_time,
-    # brute force
     des_encrypt_block, _candidate_to_des_key, xdes_encrypt_block,
     brute_force_des, brute_force_xdes,
-    brute_force_des_gpu, brute_force_xdes_gpu,
     BRUTE_CHARSET_ALPHA, BRUTE_CHARSET_ALPHANUM, BRUTE_CHARSET_COMMON,
 )
 
@@ -68,9 +66,9 @@ class XDESApp(tk.Tk):
         inner_hdr = tk.Frame(hdr, bg=BG2, pady=10)
         inner_hdr.pack(fill="x")
 
-        tk.Label(inner_hdr, text="◈  IASSING", font=("Courier New", 15, "bold"),
+        tk.Label(inner_hdr, text="◈  XDES-A", font=("Courier New", 15, "bold"),
                  bg=BG2, fg=ACCENT).pack(side="left", padx=20)
-        tk.Label(inner_hdr, text="Encryptor and Decryptor  //  XDES-A Academic Cipher",
+        tk.Label(inner_hdr, text="An improved DES Algorithm",
                  font=MONO_SM, bg=BG2, fg=FG_DIM).pack(side="left")
 
         credits_frame = tk.Frame(inner_hdr, bg=BG2)
@@ -119,11 +117,11 @@ class XDESApp(tk.Tk):
         body.pack(fill="both", expand=True)
         return outer, body
 
-    def _labeled_entry(self, parent, label, show=None, width=40):
+    def _labeled_entry(self, parent, label, width=40):
         tk.Label(parent, text=label, font=MONO_SM, bg=BG3, fg=FG_DIM,
                  anchor="w").pack(anchor="w", pady=(6,1))
         e = tk.Entry(parent, font=MONO, bg=BG, fg=ACCENT, insertbackground=ACCENT,
-                     relief="flat", bd=6, width=width, show=show)
+                     relief="flat", bd=6, width=width)
         e.pack(fill="x", ipady=4)
         return e
 
@@ -157,58 +155,36 @@ class XDESApp(tk.Tk):
 
     def _status(self, lbl, text, fg=FG_DIM):
         lbl.config(text=text, fg=fg)
-        
+
     def _make_scrollable_tab(self):
         container = tk.Frame(self.nb, bg=BG)
-
         container.grid_rowconfigure(0, weight=1)
         container.grid_columnconfigure(0, weight=1)
 
-        canvas = tk.Canvas(
-            container,
-            bg=BG,
-            highlightthickness=0,
-            bd=0
-        )
-
-        scrollbar = tk.Scrollbar(
-            container,
-            orient="vertical",
-            command=canvas.yview
-        )
-
+        canvas = tk.Canvas(container, bg=BG, highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
         scroll_frame = tk.Frame(canvas, bg=BG)
+        window_id = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
 
-        window_id = canvas.create_window(
-            (0, 0),
-            window=scroll_frame,
-            anchor="nw"
-        )
-
-        # Update scroll region
         def on_frame_configure(event):
             canvas.configure(scrollregion=canvas.bbox("all"))
-
         scroll_frame.bind("<Configure>", on_frame_configure)
 
-        # Make inner frame match canvas width
         def on_canvas_configure(event):
             canvas.itemconfig(window_id, width=event.width)
-
         canvas.bind("<Configure>", on_canvas_configure)
 
-        # Mousewheel support
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         return container, scroll_frame
+
     # ── TAB 1: ENCRYPT ──────────────────────
 
     def _tab_encrypt(self):
@@ -226,9 +202,9 @@ class XDESApp(tk.Tk):
         col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
         col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        self.enc_pt  = self._labeled_entry(col1, "PLAINTEXT  (1–16 ASCII bytes)")
+        self.enc_pt = self._labeled_entry(col1, "PLAINTEXT  (1–16 ASCII bytes)")
         self.enc_pt.insert(0, "HELLO XDES-A!!")
-        self.enc_pw  = self._labeled_entry(col2, "PASSWORD  (any length)", show="•")
+        self.enc_pw = self._labeled_entry(col2, "PASSWORD  (any length)")
         self.enc_pw.insert(0, "MyS3cur3Pass!")
 
         tk.Label(b_in,
@@ -313,8 +289,8 @@ class XDESApp(tk.Tk):
         self._write(self.enc_out, "\n".join(lines))
         self._status(self.enc_status, f"✓  Done. Packet: {len(packet)} bytes.", GREEN)
 
-        self.dec_ct.delete(0, "end");  self.dec_ct.insert(0, packet_hex)
-        self.dec_pw.delete(0, "end");  self.dec_pw.insert(0, pw_str)
+        self.dec_ct.delete(0, "end"); self.dec_ct.insert(0, packet_hex)
+        self.dec_pw.delete(0, "end"); self.dec_pw.insert(0, pw_str)
 
     def _clear_enc(self):
         self.enc_pt.delete(0, "end")
@@ -337,8 +313,8 @@ class XDESApp(tk.Tk):
         col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
         col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        self.dec_ct  = self._labeled_entry(col1, "ENCRYPTED DATA  (hex from Encrypt tab)")
-        self.dec_pw  = self._labeled_entry(col2, "PASSWORD", show="•")
+        self.dec_ct = self._labeled_entry(col1, "ENCRYPTED DATA  (hex from Encrypt tab)")
+        self.dec_pw = self._labeled_entry(col2, "PASSWORD")
 
         btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
         self._btn(btn_row, "  ▶  DECRYPT  ", self._do_decrypt, color=GREEN).pack(side="left", padx=(0,8))
@@ -427,9 +403,9 @@ class XDESApp(tk.Tk):
         col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,8))
         col2 = tk.Frame(row, bg=BG3); col2.pack(side="left", fill="x", expand=True)
 
-        self.av_pt  = self._labeled_entry(col1, "PLAINTEXT  (up to 16 ASCII chars)")
+        self.av_pt = self._labeled_entry(col1, "PLAINTEXT  (up to 16 ASCII chars)")
         self.av_pt.insert(0, "HELLO XDES-A!!")
-        self.av_pw  = self._labeled_entry(col2, "PASSWORD", show="•")
+        self.av_pw = self._labeled_entry(col2, "PASSWORD")
         self.av_pw.insert(0, "MyS3cur3Pass!")
 
         tk.Label(b_in,
@@ -513,7 +489,7 @@ class XDESApp(tk.Tk):
 
         self.tr_pt = self._labeled_entry(col1, "PLAINTEXT  (up to 16 ASCII chars)")
         self.tr_pt.insert(0, "HELLO XDES-A!!")
-        self.tr_pw = self._labeled_entry(col2, "PASSWORD", show="•")
+        self.tr_pw = self._labeled_entry(col2, "PASSWORD")
         self.tr_pw.insert(0, "MyS3cur3Pass!")
 
         tk.Label(b_in,
@@ -579,7 +555,7 @@ class XDESApp(tk.Tk):
             "",
             f"  Plaintext (ASCII)    :  {pt_str!r}",
             f"  Plaintext (hex)      :  {pt_b.hex().upper()}",
-            f"  Password             :  {'•' * len(pw_str)}",
+            f"  Password             :  {pw_str}",
             "",
             "  ── STEP 1: Argon2id KDF (fixed zero salt) ───────────────",
             f"  K_pre                :  {keys['pre'].hex().upper()}",
@@ -681,10 +657,10 @@ class XDESApp(tk.Tk):
         c_lbf, b_lbf = self._card(tab, "► SECTION B — LIVE BRUTE FORCE ENGINE  (Task Manager Showcase)")
         c_lbf.grid(row=3, column=0, sticky="ew", padx=16, pady=(8,4))
 
-        # Info banner
         info = (
             "  ⚙  Encrypts a known plaintext and brute-forces it candidate by candidate.\n"
-            "     Standard DES is quick; XDES-A goes through the Argon2id path for each guess."
+            "     Standard DES is quick; XDES-A goes through the full Argon2id path for each guess.\n"
+            "     Warning: longer passwords with larger charsets will take significantly more time."
         )
         tk.Label(b_lbf, text=info, font=MONO_SM, bg=BG3, fg=YELLOW,
                  justify="left", anchor="w").pack(anchor="w", pady=(0,6))
@@ -699,23 +675,21 @@ class XDESApp(tk.Tk):
         tk.Label(cipher_col, text="CIPHER", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
 
         self._lbf_cipher = tk.StringVar(value="xdes")
-        des_rb = tk.Radiobutton(
-            cipher_col, text="DES [CPU]",
+        tk.Radiobutton(
+            cipher_col, text="DES",
             variable=self._lbf_cipher, value="des",
             font=MONO_SM, bg=BG3, fg=ACCENT, selectcolor=BG,
             activebackground=BG3, activeforeground=ACCENT,
             relief="flat", bd=0
-        )
-        des_rb.pack(anchor="w", pady=2)
+        ).pack(anchor="w", pady=2)
 
-        xdes_rb = tk.Radiobutton(
-            cipher_col, text="XDES [GPU]",
+        tk.Radiobutton(
+            cipher_col, text="XDES-A",
             variable=self._lbf_cipher, value="xdes",
             font=MONO_SM, bg=BG3, fg=GREEN, selectcolor=BG,
             activebackground=BG3, activeforeground=GREEN,
             relief="flat", bd=0
-        )
-        xdes_rb.pack(anchor="w", pady=2)
+        ).pack(anchor="w", pady=2)
 
         # Known plaintext
         pt_col = tk.Frame(cfg_row, bg=BG3); pt_col.pack(side="left", fill="x", expand=True, padx=(0,12))
@@ -726,9 +700,9 @@ class XDESApp(tk.Tk):
         self._lbf_pt.insert(0, "HELLO")
         self._lbf_pt.pack(fill="x", ipady=4)
 
-        # Secret (what the attacker is trying to find) — VISIBLE
+        # Secret password — visible, no length cap
         sec_col = tk.Frame(cfg_row, bg=BG3); sec_col.pack(side="left", fill="x", expand=True)
-        tk.Label(sec_col, text="SECRET PASSWORD  (visible  |  max 3 chars)",
+        tk.Label(sec_col, text="SECRET PASSWORD  (visible — attacker is trying to find this)",
                  font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w")
         self._lbf_secret = tk.Entry(sec_col, font=MONO, bg=BG, fg=RED, insertbackground=RED,
                                     relief="flat", bd=6, width=16)
@@ -741,34 +715,43 @@ class XDESApp(tk.Tk):
         cs_col = tk.Frame(cfg2_row, bg=BG3); cs_col.pack(side="left", padx=(0,24))
         tk.Label(cs_col, text="CHARSET", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
         self._lbf_charset = tk.StringVar(value="alpha")
-        for val, label in [("alpha","a–z only (26)"), ("alphanum","a–z + 0–9 (36)"), ("common","a–z + 0–9 + !@# (39)")]:
+        for val, label in [
+            ("alpha",    "a–z only (26)"),
+            ("alphanum", "a–z + 0–9 (36)"),
+            ("common",   "a–z + 0–9 + !@# (39)"),
+        ]:
             tk.Radiobutton(cs_col, text=label, variable=self._lbf_charset, value=val,
                            font=MONO_SM, bg=BG3, fg=FG, selectcolor=BG,
                            activebackground=BG3, activeforeground=FG,
                            relief="flat", bd=0).pack(anchor="w")
 
+        # Max length — now goes up to 6, with a free-entry fallback
         ml_col = tk.Frame(cfg2_row, bg=BG3); ml_col.pack(side="left", padx=(0,24))
         tk.Label(ml_col, text="MAX LENGTH", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
         self._lbf_maxlen = tk.StringVar(value="3")
-        for v in ["1","2","3"]:
+        for v in ["1", "2", "3", "4", "5", "6"]:
             tk.Radiobutton(ml_col, text=f"Up to {v} char(s)", variable=self._lbf_maxlen, value=v,
                            font=MONO_SM, bg=BG3, fg=FG, selectcolor=BG,
                            activebackground=BG3, activeforeground=FG,
                            relief="flat", bd=0).pack(anchor="w")
 
-        gpu_col = tk.Frame(cfg2_row, bg=BG3); gpu_col.pack(side="left")
-        tk.Label(gpu_col, text="ACCELERATION", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
-        self._lbf_use_gpu = tk.BooleanVar(value=True)
-        tk.Checkbutton(gpu_col, text="Enable GPU (4 workers)", variable=self._lbf_use_gpu,
-                       font=MONO_SM, bg=BG3, fg=GREEN, selectcolor=BG,
-                       activebackground=BG3, activeforeground=GREEN,
-                       relief="flat", bd=0).pack(anchor="w")
+        # Custom length entry
+        custom_row = tk.Frame(ml_col, bg=BG3); custom_row.pack(anchor="w", pady=(4,0))
+        tk.Label(custom_row, text="Custom:", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(side="left")
+        self._lbf_maxlen_custom = tk.Entry(custom_row, font=MONO, bg=BG, fg=ACCENT,
+                                           insertbackground=ACCENT, relief="flat", bd=4, width=4)
+        self._lbf_maxlen_custom.pack(side="left", padx=(4,0), ipady=2)
+        tk.Button(custom_row, text="Set", font=MONO_SM, bg=BG3, fg=ACCENT,
+                  relief="flat", bd=0, cursor="hand2",
+                  command=lambda: self._lbf_maxlen.set(
+                      self._lbf_maxlen_custom.get().strip() or "3"
+                  )).pack(side="left", padx=(4,0))
 
         # Buttons
         lbf_btn_row = tk.Frame(b_lbf, bg=BG3, pady=8); lbf_btn_row.pack(anchor="w")
         self._lbf_start_btn = self._btn(lbf_btn_row, "  ▶  START BRUTE FORCE  ", self._do_live_bf, color=RED)
         self._lbf_start_btn.pack(side="left", padx=(0,8))
-        self._lbf_stop_btn  = self._btn(lbf_btn_row, "  ■  STOP  ", self._stop_live_bf, color=ORANGE)
+        self._lbf_stop_btn = self._btn(lbf_btn_row, "  ■  STOP  ", self._stop_live_bf, color=ORANGE)
         self._lbf_stop_btn.pack(side="left", padx=(0,8))
         self._lbf_stop_btn.config(state="disabled")
 
@@ -797,7 +780,14 @@ class XDESApp(tk.Tk):
     # ── brute force estimator helpers ───────
 
     def _rating_color_str(self, rating):
-        return {"CRITICAL":"⛔","WEAK":"⚠ ","MODERATE":"◈ ","STRONG":"✓ ","VERY STRONG":"✓✓","UNBREAKABLE":"🔒"}.get(rating,"  ")
+        return {
+            "CRITICAL":    "⛔",
+            "WEAK":        "⚠ ",
+            "MODERATE":    "◈ ",
+            "STRONG":      "✓ ",
+            "VERY STRONG": "✓✓",
+            "UNBREAKABLE": "🔒",
+        }.get(rating, "  ")
 
     def _do_bruteforce(self):
         pw = self.bf_pw.get()
@@ -823,7 +813,7 @@ class XDESApp(tk.Tk):
             "║         BRUTE FORCE RESISTANCE ANALYSIS                 ║",
             "╚══════════════════════════════════════════════════════════╝",
             "",
-            f"  Password          :  {'•' * len(pw)}  ({len(pw)} chars)",
+            f"  Password          :  {pw}  ({len(pw)} chars)",
             f"  Charset size      :  {r['charset']} possible characters",
             f"  Keyspace          :  {r['charset']}^{r['length']} = {r['keyspace']:.4e} combinations",
             "",
@@ -913,16 +903,20 @@ class XDESApp(tk.Tk):
         secret     = self._lbf_secret.get().strip()
         cipher     = self._lbf_cipher.get()
         charset_id = self._lbf_charset.get()
-        max_len    = int(self._lbf_maxlen.get())
+
+        try:
+            max_len = int(self._lbf_maxlen.get())
+            if max_len < 1:
+                raise ValueError
+        except ValueError:
+            self._write(self._lbf_out, "⚠  Invalid max length. Please enter a positive integer.")
+            return
 
         if not pt_str:
             self._write(self._lbf_out, "⚠  Enter a known plaintext.")
             return
         if not secret:
             self._write(self._lbf_out, "⚠  Enter a secret to brute-force.")
-            return
-        if len(secret) > 4:
-            self._write(self._lbf_out, "⚠  Secret must be ≤ 4 characters for a live demo.")
             return
 
         charset_map = {
@@ -932,7 +926,22 @@ class XDESApp(tk.Tk):
         }
         charset = charset_map[charset_id]
 
-        # Pre-compute target ciphertext so attacker has something to match against
+        # Warn if the search space is very large
+        space_estimate = len(charset) ** max_len
+        if space_estimate > 5_000_000 and cipher == "xdes":
+            warning = (
+                f"  ⚠  WARNING: Search space is ~{space_estimate:,} candidates.\n"
+                f"     XDES-A runs Argon2id per attempt (~10/sec). This may take a very long time.\n"
+                f"     Consider reducing max length or using DES mode for the demo.\n\n"
+            )
+        elif space_estimate > 100_000_000 and cipher == "des":
+            warning = (
+                f"  ⚠  WARNING: Search space is ~{space_estimate:,} candidates.\n"
+                f"     This may take a while even for DES.\n\n"
+            )
+        else:
+            warning = ""
+
         pt_b = pt_str.encode("utf-8")
 
         if cipher == "des":
@@ -940,31 +949,33 @@ class XDESApp(tk.Tk):
             target_ct = des_encrypt_block(pt_b[:8].ljust(8, b'\x00'), key8)
             argon_salt = None
         else:
-            argon_salt = bytes(16)   # fixed zero salt for demo repeatability
+            argon_salt = bytes(16)
             keys       = derive_keys(secret.encode(), argon_salt)
             pt16       = (pt_b + bytes(16))[:16]
             target_ct  = xdes_encrypt_block(pt16, keys)
 
         cipher_label = "Standard DES" if cipher == "des" else "XDES-A (Argon2id)"
-        accel_label = "[GPU]" if self._lbf_use_gpu.get() else "[CPU]"
 
         header = [
             "╔══════════════════════════════════════════════════════════╗",
-            f"║  LIVE BRUTE FORCE  —  {cipher_label:<22} {accel_label:<10}║",
+            f"║  LIVE BRUTE FORCE  —  {cipher_label:<35}║",
             "╚══════════════════════════════════════════════════════════╝",
             "",
             f"  Known plaintext  :  {pt_str!r}",
             f"  Target ciphertext:  {target_ct.hex().upper()}",
             f"  Charset          :  {charset_id}  ({len(charset)} chars)",
             f"  Max length       :  {max_len}",
-            f"  Secret (hidden)  :  {'•' * len(secret)}",
+            f"  Search space     :  ~{space_estimate:,} candidates",
+            f"  Secret (visible) :  {secret}",
             "",
-            f"  ── LIVE LOG ─────────────────────────────────────────────",
+            "  ── LIVE LOG ─────────────────────────────────────────────",
             "",
         ]
+        if warning:
+            header.insert(-2, warning)
+
         self._write(self._lbf_out, "\n".join(header))
 
-        # Rate tracking
         self._lbf_last_update = time.perf_counter()
         self._lbf_last_count  = 0
 
@@ -972,11 +983,9 @@ class XDESApp(tk.Tk):
         self._bf_stop_event.clear()
         self._lbf_start_btn.config(state="disabled")
         self._lbf_stop_btn.config(state="normal")
-        gpu_status = "GPU ACCELERATED" if self._lbf_use_gpu.get() else "CPU SINGLE-THREAD"
-        self._status(self._lbf_status, f"⏳  [{gpu_status}] Cracking...  ", YELLOW)
+        self._status(self._lbf_status, "⏳  Cracking…", YELLOW)
 
         def on_attempt(attempt, candidate, elapsed, found):
-            # Throttle UI updates to every 50 attempts or on find
             if attempt % 50 != 0 and not found:
                 return
 
@@ -987,8 +996,7 @@ class XDESApp(tk.Tk):
             self._lbf_last_count  = attempt
 
             prefix = "  ✓  FOUND! " if found else "  ···  "
-            line   = f"{prefix}[#{attempt:>6}]  trying: {candidate!r:<8}  " \
-                     f"elapsed: {elapsed:6.2f}s\n"
+            line   = f"{prefix}[#{attempt:>6}]  trying: {candidate!r:<12}  elapsed: {elapsed:6.2f}s\n"
 
             self.after(0, lambda l=line: self._append(self._lbf_out, l))
             self.after(0, lambda: self._lbf_stat_attempt.config(text=f"Attempts: {attempt:,}"))
@@ -1003,7 +1011,7 @@ class XDESApp(tk.Tk):
                     f"  ║  🔓  SECRET CRACKED!             ║\n"
                     f"  ╚══════════════════════════════════╝\n"
                     f"\n"
-                    f"  Found: {candidate!r}\n"
+                    f"  Found    : {candidate!r}\n"
                     f"  Attempts : {attempt:,}\n"
                     f"  Time     : {elapsed:.2f}s\n"
                     f"  Avg rate : {attempt/max(elapsed,0.001):,.0f} attempts/sec\n"
@@ -1013,45 +1021,30 @@ class XDESApp(tk.Tk):
                     f"\n"
                     f"  ⚠  Secret not found in search space.\n"
                     f"  Attempts: {attempt:,}  Time: {elapsed:.2f}s\n"
+                    f"  Tip: Make sure the secret is within the chosen charset and max length.\n"
                 )
             self.after(0, lambda: self._append(self._lbf_out, summary))
             self.after(0, lambda: self._status(
                 self._lbf_status,
-                f"✓  Done — {attempt:,} attempts in {elapsed:.2f}",
+                f"✓  Done — {attempt:,} attempts in {elapsed:.2f}s",
                 GREEN if found else YELLOW))
             self.after(0, self._bf_reset_buttons)
 
         def run():
             try:
-                use_gpu = self._lbf_use_gpu.get()
                 if cipher == "des":
-                    if use_gpu:
-                        brute_force_des_gpu(
-                            target_ct, pt_b[:8].ljust(8, b'\x00'),
-                            max_len, charset,
-                            self._bf_stop_event, on_attempt, on_done, num_workers=4
-                        )
-                    else:
-                        brute_force_des(
-                            target_ct, pt_b[:8].ljust(8, b'\x00'),
-                            max_len, charset,
-                            self._bf_stop_event, on_attempt, on_done,
-                        )
+                    brute_force_des(
+                        target_ct, pt_b[:8].ljust(8, b'\x00'),
+                        max_len, charset,
+                        self._bf_stop_event, on_attempt, on_done,
+                    )
                 else:
-                    if use_gpu:
-                        brute_force_xdes_gpu(
-                            target_ct, pt_b,
-                            argon_salt,
-                            max_len, charset,
-                            self._bf_stop_event, on_attempt, on_done, num_workers=4
-                        )
-                    else:
-                        brute_force_xdes(
-                            target_ct, pt_b,
-                            argon_salt,
-                            max_len, charset,
-                            self._bf_stop_event, on_attempt, on_done,
-                        )
+                    brute_force_xdes(
+                        target_ct, pt_b,
+                        argon_salt,
+                        max_len, charset,
+                        self._bf_stop_event, on_attempt, on_done,
+                    )
             except Exception as ex:
                 self.after(0, lambda: self._append(self._lbf_out, f"\n  ⚠  Error: {ex}\n"))
                 self.after(0, self._bf_reset_buttons)
@@ -1069,6 +1062,3 @@ class XDESApp(tk.Tk):
         self._lbf_stop_btn.config(state="disabled")
 
 
-if __name__ == "__main__":
-    app = XDESApp()
-    app.mainloop()
