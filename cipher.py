@@ -11,7 +11,7 @@ import struct
 from argon2.low_level import hash_secret_raw, Type
 
 # ─────────────────────────────────────────────
-#  DES TABLES 
+#  DES TABLES
 # ─────────────────────────────────────────────
 
 IP = [
@@ -36,11 +36,17 @@ P = [
     16, 7,20,21,29,12,28,17, 1,15,23,26, 5,18,31,10,
      2, 8,24,14,32,27, 3, 9,19,13,30, 6,22,11, 4,25,
 ]
+PC1_C = [57,49,41,33,25,17, 9, 1,58,50,42,34,26,18,
+         10, 2,59,51,43,35,27,19,11, 3,60,52,44,36]
+PC1_D = [63,55,47,39,31,23,15, 7,62,54,46,38,30,22,
+         14, 6,61,53,45,37,29,21,13, 5,28,20,12, 4]
 PC2 = [
     14,17,11,24, 1, 5, 3,28,15, 6,21,10,23,19,12, 4,
     26, 8,16, 7,27,20,13, 2,41,52,31,37,47,55,30,40,
     51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32,
 ]
+SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
+
 S_BOXES = [
     [[14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7],[0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8],[4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0],[15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13]],
     [[15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10],[3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5],[0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15],[13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9]],
@@ -79,7 +85,7 @@ def xor_bits(a, b):
     return [x ^ y for x, y in zip(a, b)]
 
 def feistel(R, K):
-    """Standard DES Feistel function with proven S-boxes (fixed, not key-dependent)."""
+    """Standard DES Feistel function."""
     expanded = permute(R, E)
     xored = xor_bits(expanded, K)
     sbox_out = []
@@ -93,17 +99,55 @@ def feistel(R, K):
     return permute(sbox_out, P)
 
 # ─────────────────────────────────────────────
+#  STANDARD DES KEY SCHEDULE
+# ─────────────────────────────────────────────
+
+def des_key_schedule(key_8bytes: bytes) -> list:
+    """
+    Derive 16 DES round keys (each 48 bits) from a standard 8-byte / 64-bit key.
+    Uses the real DES PC1 + shift + PC2 schedule.
+    """
+    key_bits = bytes_to_bits(key_8bytes)
+    C = [key_bits[b - 1] for b in PC1_C]
+    D = [key_bits[b - 1] for b in PC1_D]
+    round_keys = []
+    for shift in SHIFTS:
+        C = C[shift:] + C[:shift]
+        D = D[shift:] + D[:shift]
+        CD = C + D
+        # PC2 indexes into a 56-bit CD array
+        k48 = [CD[b - 1] for b in PC2]
+        round_keys.append(k48)
+    return round_keys
+
+# ─────────────────────────────────────────────
+#  STANDARD DES BLOCK ENCRYPT (ECB, 64-bit)
+# ─────────────────────────────────────────────
+
+def des_encrypt_block(block_8: bytes, key_8: bytes) -> bytes:
+    """
+    Encrypt a single 8-byte block with standard DES (ECB, no padding).
+    key_8 must be exactly 8 bytes (64 bits, parity bits ignored).
+    """
+    round_keys = des_key_schedule(key_8)
+    bits = permute(bytes_to_bits(block_8), IP)
+    L, R = bits[:32], bits[32:]
+    for K in round_keys:
+        L, R = R, xor_bits(L, feistel(R, K))
+    return bits_to_bytes(permute(R + L, IP_INV))
+
+def des_decrypt_block(block_8: bytes, key_8: bytes) -> bytes:
+    """Decrypt a single 8-byte DES block."""
+    round_keys = list(reversed(des_key_schedule(key_8)))
+    bits = permute(bytes_to_bits(block_8), IP)
+    L, R = bits[:32], bits[32:]
+    for K in round_keys:
+        L, R = R, xor_bits(L, feistel(R, K))
+    return bits_to_bytes(permute(R + L, IP_INV))
+
+# ─────────────────────────────────────────────
 #  XDES-A KEY DERIVATION  (Argon2id)
 # ─────────────────────────────────────────────
-#
-#  Total KDF output: 152 bytes =
-#    K_pre   8 bytes  (pre-whitening)
-#    K_i    16×7 bytes = 112 bytes  (one 56-bit key per round, no key schedule)
-#    K_post  8 bytes  (post-whitening)
-#    K_mac  24 bytes  (HMAC-SHA256 key — truncated to 24 for display clarity)
-#
-#  Argon2id params (academic / low-resource):
-#    time_cost=2, memory_cost=65536 (64 MB), parallelism=1
 
 KDF_TOTAL   = 8 + 112 + 8 + 24   # 152 bytes
 ARGON2_T    = 2
@@ -111,10 +155,6 @@ ARGON2_M    = 65536
 ARGON2_P    = 1
 
 def derive_keys(password: bytes, salt: bytes) -> dict:
-    """
-    Derive all XDES-A subkeys from password + salt via Argon2id.
-    Returns a dict with pre, rounds (list of 16 bit-lists), post, mac.
-    """
     raw = hash_secret_raw(
         secret=password,
         salt=salt,
@@ -124,22 +164,17 @@ def derive_keys(password: bytes, salt: bytes) -> dict:
         hash_len=KDF_TOTAL,
         type=Type.ID,
     )
-    k_pre   = raw[0:8]
-    k_rounds_raw = raw[8:120]          # 16 × 7 bytes
-    k_post  = raw[120:128]
-    k_mac   = raw[128:152]
+    k_pre        = raw[0:8]
+    k_rounds_raw = raw[8:120]
+    k_post       = raw[120:128]
+    k_mac        = raw[128:152]
 
-    # Convert each 7-byte block to a 48-bit PC2-permuted subkey (DES expects 48 bits)
-    # We take the low 56 bits (7 bytes) and apply PC2 to get 48 bits — same as DES does
     round_keys = []
     for i in range(16):
-        chunk = k_rounds_raw[i*7:(i+1)*7]
-        # pad to 8 bytes for PC2 (PC2 indexes up to 56)
-        padded = chunk + bytes(1)
+        chunk   = k_rounds_raw[i*7:(i+1)*7]
+        padded  = chunk + bytes(1)
         bits_56 = bytes_to_bits(padded)[:56]
-        # apply PC2 — but PC2 expects 56 bits in C+D arrangement
-        # We just use it directly since we just need 48 bits from 56
-        k48 = permute(bits_56, PC2)
+        k48     = permute(bits_56, PC2)
         round_keys.append(k48)
 
     return {
@@ -153,23 +188,11 @@ def derive_keys(password: bytes, salt: bytes) -> dict:
 # ─────────────────────────────────────────────
 #  XDES-A BLOCK CIPHER  (128-bit block)
 # ─────────────────────────────────────────────
-#
-#  Block = 16 bytes = [L_block (8 bytes) | R_block (8 bytes)]
-#
-#  Encrypt:
-#    1. Pre-whitening:  L ^= K_pre,  R ^= K_pre
-#    2. 16 Feistel rounds on L (using R as cross-feed after round 8)
-#       and 16 Feistel rounds on R (using L as cross-feed after round 8)
-#       — simple parallel Feistel with mid-point swap for cross-mixing
-#    3. Post-whitening: L ^= K_post, R ^= K_post
-#
-#  Decrypt reverses rounds and whitening.
 
 def _xor_bytes(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, b))
 
 def _feistel_half(block_8: bytes, subkeys: list, encrypt: bool) -> bytes:
-    """Run 16-round Feistel on a single 64-bit half."""
     keys = subkeys if encrypt else list(reversed(subkeys))
     bits = permute(bytes_to_bits(block_8), IP)
     L, R = bits[:32], bits[32:]
@@ -178,64 +201,44 @@ def _feistel_half(block_8: bytes, subkeys: list, encrypt: bool) -> bytes:
     return bits_to_bytes(permute(R + L, IP_INV))
 
 def xdes_encrypt_block(block_16: bytes, keys: dict) -> bytes:
-    """Encrypt a single 128-bit block under XDES-A."""
     L = block_16[:8]
     R = block_16[8:]
-
-    # Pre-whitening
     L = _xor_bytes(L, keys["pre"])
     R = _xor_bytes(R, keys["pre"])
-
-    # 16 Feistel rounds on each half; mid-point cross-mix at round 8
     rounds = keys["rounds"]
     L = _feistel_half(L, rounds[:8],  encrypt=True)
     R = _feistel_half(R, rounds[:8],  encrypt=True)
-    # cross-mix: swap and XOR
     L, R = _xor_bytes(L, R), _xor_bytes(R, L)
     L = _feistel_half(L, rounds[8:], encrypt=True)
     R = _feistel_half(R, rounds[8:], encrypt=True)
-
-    # Post-whitening
     L = _xor_bytes(L, keys["post"])
     R = _xor_bytes(R, keys["post"])
-
     return L + R
 
 def xdes_decrypt_block(block_16: bytes, keys: dict) -> bytes:
-    """Decrypt a single 128-bit block under XDES-A."""
     L = block_16[:8]
     R = block_16[8:]
-
-    # Undo post-whitening
     L = _xor_bytes(L, keys["post"])
     R = _xor_bytes(R, keys["post"])
-
-    # Undo second half of Feistel (reversed)
     rounds = keys["rounds"]
     L = _feistel_half(L, rounds[8:], encrypt=False)
     R = _feistel_half(R, rounds[8:], encrypt=False)
-    # undo cross-mix (XOR is its own inverse in this arrangement)
     L, R = _xor_bytes(L, R), _xor_bytes(R, L)
     L = _feistel_half(L, rounds[:8], encrypt=False)
     R = _feistel_half(R, rounds[:8], encrypt=False)
-
-    # Undo pre-whitening
     L = _xor_bytes(L, keys["pre"])
     R = _xor_bytes(R, keys["pre"])
-
     return L + R
 
 # ─────────────────────────────────────────────
-#  CTR MODE  (128-bit block, 128-bit nonce/counter)
+#  CTR MODE
 # ─────────────────────────────────────────────
 
 def _ctr_keystream_block(nonce: bytes, counter: int, keys: dict) -> bytes:
-    """Encrypt nonce||counter to produce a 128-bit keystream block."""
     ctr_block = nonce[:8] + struct.pack(">Q", counter)
     return xdes_encrypt_block(ctr_block, keys)
 
 def ctr_encrypt(plaintext: bytes, keys: dict, nonce: bytes) -> bytes:
-    """CTR-mode encrypt/decrypt (symmetric)."""
     out = bytearray()
     for i in range(0, len(plaintext), 16):
         chunk = plaintext[i:i+16]
@@ -246,8 +249,6 @@ def ctr_encrypt(plaintext: bytes, keys: dict, nonce: bytes) -> bytes:
 # ─────────────────────────────────────────────
 #  FULL XDES-A PIPELINE
 # ─────────────────────────────────────────────
-#
-#  Packet layout: argon_salt(16) || nonce(8) || ciphertext(16) || mac(16)
 
 def xdes_a_encrypt(plaintext: bytes, password: bytes):
     argon_salt = os.urandom(16)
@@ -257,24 +258,6 @@ def xdes_a_encrypt(plaintext: bytes, password: bytes):
     tag        = hmac.new(keys["mac"], nonce + ciphertext, hashlib.sha256).digest()[:16]
     packet     = argon_salt + nonce + ciphertext + tag
     return argon_salt, nonce, ciphertext, tag, packet, keys
-
-
-def xdes_a_decrypt(packet: bytes, password: bytes):
-    if len(packet) < 40:
-        raise ValueError("Invalid packet length")
-
-    argon_salt = packet[:16]
-    nonce      = packet[16:24]
-    tag        = packet[-16:]
-    ciphertext = packet[24:-16]
-
-    keys = derive_keys(password, argon_salt)
-    expected_tag = hmac.new(keys["mac"], nonce + ciphertext, hashlib.sha256).digest()[:16]
-    if not hmac.compare_digest(expected_tag, tag):
-        raise ValueError("MAC verification failed")
-
-    plaintext = ctr_encrypt(ciphertext, keys, nonce)
-    return argon_salt, nonce, ciphertext, tag, plaintext, keys
 
 def xdes_a_decrypt(packet: bytes, password: bytes):
     if len(packet) < 16 + 8 + 16:
@@ -291,19 +274,13 @@ def xdes_a_decrypt(packet: bytes, password: bytes):
     return argon_salt, nonce, ciphertext, tag_recv, plaintext, keys
 
 # ─────────────────────────────────────────────
-#  AVALANCHE ANALYSIS  (on 128-bit block)
+#  AVALANCHE ANALYSIS
 # ─────────────────────────────────────────────
 
 def avalanche_analysis(plaintext: bytes, password: bytes):
-    """
-    Flip each bit of the 128-bit block and measure diffusion through the
-    XDES-A block cipher directly (not CTR, which would trivially pass 1 bit).
-    Uses xdes_encrypt_block so whitening + Feistel rounds are all exercised.
-    """
     pt   = (plaintext + bytes(16))[:16]
-    keys = derive_keys(password, bytes(16))      # fixed salt for determinism
+    keys = derive_keys(password, bytes(16))
     base_ct = xdes_encrypt_block(pt, keys)
-
     results = []
     for bit_pos in range(128):
         byte_idx = bit_pos // 8
@@ -313,12 +290,11 @@ def avalanche_analysis(plaintext: bytes, password: bytes):
         fc   = xdes_encrypt_block(bytes(flipped), keys)
         diff = sum(bin(x ^ y).count('1') for x, y in zip(base_ct, fc))
         results.append(diff)
-
     avg = sum(results) / 128
     return avg, (avg / 128) * 100, results
 
 # ─────────────────────────────────────────────
-#  BRUTE FORCE SIMULATION HELPERS
+#  BRUTE FORCE HELPERS
 # ─────────────────────────────────────────────
 
 WEAK_PASSWORDS = [
@@ -329,11 +305,6 @@ WEAK_PASSWORDS = [
 ]
 
 def estimate_crack_time(password: str) -> dict:
-    """
-    Estimate cracking resistance under two scenarios:
-      A) Plain MD5/SHA-256 (fast hash, ~10 billion/sec on GPU cluster)
-      B) Argon2id t=2 m=64MB  (~10 guesses/sec on same hardware)
-    """
     charset = 0
     if any(c.islower() for c in password): charset += 26
     if any(c.isupper() for c in password): charset += 26
@@ -342,8 +313,8 @@ def estimate_crack_time(password: str) -> dict:
     charset = max(charset, 1)
 
     keyspace      = charset ** len(password)
-    SHA256_RATE   = 10_000_000_000   # 10 B/sec modern GPU cluster
-    ARGON2_RATE   = 10               # ~10/sec with 64 MB per hash
+    SHA256_RATE   = 10_000_000_000
+    ARGON2_RATE   = 10
 
     sha_secs  = keyspace / 2 / SHA256_RATE
     arg_secs  = keyspace / 2 / ARGON2_RATE
@@ -362,7 +333,6 @@ def estimate_crack_time(password: str) -> dict:
 
     sha_str,  sha_rating = fmt(sha_secs)
     arg_str,  arg_rating = fmt(arg_secs)
-    speedup = max(arg_secs, 1e-9) / max(sha_secs, 1e-9)   # how much SLOWER argon2 is for attacker
 
     return {
         "length":          len(password),
@@ -376,3 +346,126 @@ def estimate_crack_time(password: str) -> dict:
         "argon2_rating":   arg_rating,
         "slowdown_factor": arg_secs / max(sha_secs, 1e-9),
     }
+
+# ─────────────────────────────────────────────
+#  LIVE BRUTE FORCE ENGINE
+# ─────────────────────────────────────────────
+#
+#  Brute-forces a SHORT password (1–4 chars from a limited charset)
+#  using either standard DES or XDES-A as the cipher under test.
+#  Designed for Task Manager showcase: XDES-A's Argon2id KDF will
+#  spike RAM to ~64 MB per attempt vs DES's negligible footprint.
+#
+#  Callback signature:
+#    on_attempt(attempt_num, candidate, elapsed_s, mem_mb, found)
+#    on_done(found, candidate, attempt_num, elapsed_s, peak_mem_mb)
+
+import time
+import tracemalloc
+import itertools
+
+BRUTE_CHARSET_ALPHA   = "abcdefghijklmnopqrstuvwxyz"
+BRUTE_CHARSET_ALPHANUM = "abcdefghijklmnopqrstuvwxyz0123456789"
+BRUTE_CHARSET_COMMON  = "abcdefghijklmnopqrstuvwxyz0123456789!@#"
+
+def _candidate_to_des_key(candidate: str) -> bytes:
+    """Stretch/truncate a short candidate string to exactly 8 bytes for DES."""
+    raw = candidate.encode("utf-8")
+    # repeat-pad to 8 bytes then truncate
+    key = (raw * ((8 // len(raw)) + 1))[:8]
+    return key
+
+def brute_force_des(
+    target_ct: bytes,
+    known_pt: bytes,
+    max_len: int,
+    charset: str,
+    stop_event,
+    on_attempt,
+    on_done,
+):
+    """
+    Brute-force standard DES.
+    Encrypts known_pt with each candidate key and compares to target_ct.
+    target_ct is the first 8 bytes of DES-ECB encryption of known_pt with the real key.
+    """
+    attempt = 0
+    start   = time.perf_counter()
+    tracemalloc.start()
+
+    try:
+        for length in range(1, max_len + 1):
+            for combo in itertools.product(charset, repeat=length):
+                if stop_event.is_set():
+                    on_done(False, "", attempt, time.perf_counter() - start,
+                            tracemalloc.get_traced_memory()[1] / 1e6)
+                    return
+
+                candidate = "".join(combo)
+                attempt  += 1
+                key8      = _candidate_to_des_key(candidate)
+                ct        = des_encrypt_block(known_pt[:8], key8)
+                elapsed   = time.perf_counter() - start
+                mem_mb    = tracemalloc.get_traced_memory()[1] / 1e6
+
+                found = (ct == target_ct)
+                on_attempt(attempt, candidate, elapsed, mem_mb, found)
+
+                if found:
+                    on_done(True, candidate, attempt, elapsed, mem_mb)
+                    return
+    finally:
+        tracemalloc.stop()
+
+    on_done(False, "", attempt, time.perf_counter() - start, 0.0)
+
+
+def brute_force_xdes(
+    target_ct: bytes,
+    known_pt: bytes,
+    argon_salt: bytes,
+    max_len: int,
+    charset: str,
+    stop_event,
+    on_attempt,
+    on_done,
+):
+    """
+    Brute-force XDES-A.
+    For each candidate password, runs the full Argon2id KDF + block encrypt
+    and compares the first 16 bytes of the encrypted block to target_ct.
+    This is the expensive path — each attempt allocates ~64 MB for Argon2id.
+    """
+    attempt = 0
+    start   = time.perf_counter()
+    tracemalloc.start()
+
+    try:
+        for length in range(1, max_len + 1):
+            for combo in itertools.product(charset, repeat=length):
+                if stop_event.is_set():
+                    on_done(False, "", attempt, time.perf_counter() - start,
+                            tracemalloc.get_traced_memory()[1] / 1e6)
+                    return
+
+                candidate = "".join(combo)
+                attempt  += 1
+                pw_b      = candidate.encode("utf-8")
+
+                keys = derive_keys(pw_b, argon_salt)
+                pt16 = (known_pt + bytes(16))[:16]
+                ct   = xdes_encrypt_block(pt16, keys)
+
+                elapsed = time.perf_counter() - start
+                mem_mb  = tracemalloc.get_traced_memory()[1] / 1e6
+
+                found = (ct == target_ct)
+                on_attempt(attempt, candidate, elapsed, mem_mb, found)
+
+                if found:
+                    on_done(True, candidate, attempt, elapsed, mem_mb)
+                    return
+    finally:
+        tracemalloc.stop()
+
+    on_done(False, "", attempt, time.perf_counter() - start, 0.0)

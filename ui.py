@@ -5,11 +5,18 @@ Dark terminal-inspired aesthetic with monospace fonts.
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+import threading
+import time
+
 from cipher import (
     xdes_a_encrypt, xdes_a_decrypt, avalanche_analysis,
     derive_keys, _xor_bytes, _feistel_half, _ctr_keystream_block,
     bytes_to_bits, bits_to_bytes, permute, xor_bits, feistel,
-    IP, IP_INV, WEAK_PASSWORDS, estimate_crack_time
+    IP, IP_INV, WEAK_PASSWORDS, estimate_crack_time,
+    # brute force
+    des_encrypt_block, _candidate_to_des_key, xdes_encrypt_block,
+    brute_force_des, brute_force_xdes,
+    BRUTE_CHARSET_ALPHA, BRUTE_CHARSET_ALPHANUM, BRUTE_CHARSET_COMMON,
 )
 
 # ─────────────────────────────────────────────
@@ -25,6 +32,7 @@ ACCENT2 = "#7c3aed"
 GREEN   = "#00ff9d"
 YELLOW  = "#ffd600"
 RED     = "#ff3d71"
+ORANGE  = "#ff8c00"
 FG      = "#cdd6f4"
 FG_DIM  = "#6c7086"
 MONO    = ("Courier New", 10)
@@ -39,16 +47,17 @@ class XDESApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("IASSING — Encryptor and Decryptor")
-        self.geometry("980x720")
-        self.minsize(860, 640)
+        self.geometry("1020x760")
+        self.minsize(900, 660)
         self.configure(bg=BG)
         self.resizable(True, True)
+        self._bf_stop_event = threading.Event()
+        self._bf_running    = False
         self._build_ui()
 
     # ── layout ──────────────────────────────
 
     def _build_ui(self):
-        # header
         hdr = tk.Frame(self, bg=BG, pady=0)
         hdr.pack(fill="x")
 
@@ -62,7 +71,6 @@ class XDESApp(tk.Tk):
         tk.Label(inner_hdr, text="Encryptor and Decryptor  //  XDES-A Academic Cipher",
                  font=MONO_SM, bg=BG2, fg=FG_DIM).pack(side="left")
 
-        # credits on the right
         credits_frame = tk.Frame(inner_hdr, bg=BG2)
         credits_frame.pack(side="right", padx=20)
         tk.Label(credits_frame,
@@ -139,14 +147,71 @@ class XDESApp(tk.Tk):
         box.configure(state="disabled")
         box.see("end")
 
+    def _append(self, box, text):
+        box.configure(state="normal")
+        box.insert("end", text)
+        box.configure(state="disabled")
+        box.see("end")
+
     def _status(self, lbl, text, fg=FG_DIM):
         lbl.config(text=text, fg=fg)
+        
+    def _make_scrollable_tab(self):
+        container = tk.Frame(self.nb, bg=BG)
 
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(
+            container,
+            bg=BG,
+            highlightthickness=0,
+            bd=0
+        )
+
+        scrollbar = tk.Scrollbar(
+            container,
+            orient="vertical",
+            command=canvas.yview
+        )
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        scroll_frame = tk.Frame(canvas, bg=BG)
+
+        window_id = canvas.create_window(
+            (0, 0),
+            window=scroll_frame,
+            anchor="nw"
+        )
+
+        # Update scroll region
+        def on_frame_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        scroll_frame.bind("<Configure>", on_frame_configure)
+
+        # Make inner frame match canvas width
+        def on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        # Mousewheel support
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        return container, scroll_frame
     # ── TAB 1: ENCRYPT ──────────────────────
 
     def _tab_encrypt(self):
-        tab = self._frame(self.nb)
-        self.nb.add(tab, text="  🔒  ENCRYPT  ")
+        tab_container, tab = self._make_scrollable_tab()
+        self.nb.add(tab_container, text="  🔒  ENCRYPT  ")
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
@@ -246,7 +311,6 @@ class XDESApp(tk.Tk):
         self._write(self.enc_out, "\n".join(lines))
         self._status(self.enc_status, f"✓  Done. Packet: {len(packet)} bytes.", GREEN)
 
-        # auto-fill decrypt
         self.dec_ct.delete(0, "end");  self.dec_ct.insert(0, packet_hex)
         self.dec_pw.delete(0, "end");  self.dec_pw.insert(0, pw_str)
 
@@ -259,8 +323,8 @@ class XDESApp(tk.Tk):
     # ── TAB 2: DECRYPT ──────────────────────
 
     def _tab_decrypt(self):
-        tab = self._frame(self.nb)
-        self.nb.add(tab, text="  🔓  DECRYPT  ")
+        tab_container, tab = self._make_scrollable_tab()
+        self.nb.add(tab_container, text="  🔓  DECRYPT  ")
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
@@ -349,8 +413,8 @@ class XDESApp(tk.Tk):
     # ── TAB 3: AVALANCHE ────────────────────
 
     def _tab_avalanche(self):
-        tab = self._frame(self.nb)
-        self.nb.add(tab, text="  📊  AVALANCHE  ")
+        tab_container, tab = self._make_scrollable_tab()
+        self.nb.add(tab_container, text="  📊  AVALANCHE  ")
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
@@ -433,8 +497,8 @@ class XDESApp(tk.Tk):
     # ── TAB 4: STEP TRACE ───────────────────
 
     def _tab_trace(self):
-        tab = self._frame(self.nb)
-        self.nb.add(tab, text="  🔍  STEP TRACE  ")
+        tab_container, tab = self._make_scrollable_tab()
+        self.nb.add(tab_container, text="  🔍  STEP TRACE  ")
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
@@ -479,14 +543,9 @@ class XDESApp(tk.Tk):
         self.update()
 
         keys = derive_keys(pw_str.encode(), fixed_s)
-
         L_raw = pt_b[:8]; R_raw = pt_b[8:]
-
-        # pre-whitening
         L_w = _xor_bytes(L_raw, keys["pre"])
         R_w = _xor_bytes(R_raw, keys["pre"])
-
-        # first 8 rounds on L and R independently
         rounds = keys["rounds"]
 
         def trace_half(block_8, subkeys):
@@ -502,19 +561,12 @@ class XDESApp(tk.Tk):
 
         stL1, L_mid = trace_half(L_w, rounds[:8])
         stR1, R_mid = trace_half(R_w, rounds[:8])
-
-        # cross-mix
         L_x = _xor_bytes(L_mid, R_mid)
         R_x = _xor_bytes(R_mid, L_mid)
-
         stL2, L_post = trace_half(L_x, rounds[8:])
         stR2, R_post = trace_half(R_x, rounds[8:])
-
-        # post-whitening
         L_fin = _xor_bytes(L_post, keys["post"])
         R_fin = _xor_bytes(R_post, keys["post"])
-
-        # CTR keystream block 0
         ks = _ctr_keystream_block(fixed_n, 0, keys)
         ct = bytes(p ^ k for p, k in zip(pt_b, ks[:16]))
 
@@ -540,14 +592,9 @@ class XDESApp(tk.Tk):
         ]
         for i, (lh, rh) in enumerate(stL1):
             lines.append(f"  L_R{i+1:02d}  L={lh}  R={rh}")
-
-        lines += [
-            "",
-            "  ── STEP 3: Feistel Rounds 1–8  (Right half) ────────────",
-        ]
+        lines += ["", "  ── STEP 3: Feistel Rounds 1–8  (Right half) ────────────"]
         for i, (lh, rh) in enumerate(stR1):
             lines.append(f"  R_R{i+1:02d}  L={lh}  R={rh}")
-
         lines += [
             "",
             "  ── STEP 4: Mid-Point Cross-Mix (L ⊕ R, R ⊕ L) ─────────",
@@ -558,14 +605,9 @@ class XDESApp(tk.Tk):
         ]
         for i, (lh, rh) in enumerate(stL2):
             lines.append(f"  L_R{i+9:02d}  L={lh}  R={rh}")
-
-        lines += [
-            "",
-            "  ── STEP 5: Feistel Rounds 9–16  (Right half) ───────────",
-        ]
+        lines += ["", "  ── STEP 5: Feistel Rounds 9–16  (Right half) ───────────"]
         for i, (lh, rh) in enumerate(stR2):
             lines.append(f"  R_R{i+9:02d}  L={lh}  R={rh}")
-
         lines += [
             "",
             "  ── STEP 6: Post-Whitening ───────────────────────────────",
@@ -584,16 +626,15 @@ class XDESApp(tk.Tk):
     # ── TAB 5: BRUTE FORCE DEMO ─────────────
 
     def _tab_bruteforce(self):
-        tab = self._frame(self.nb)
-        self.nb.add(tab, text="  💀  BRUTE FORCE DEMO  ")
+        tab_container, tab = self._make_scrollable_tab()
+        self.nb.add(tab_container, text="  💀  BRUTE FORCE DEMO  ")
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(1, weight=1)
 
-        c_in, b_in = self._card(tab, "► PASSWORD STRENGTH ANALYZER")
-        c_in.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
+        # ── Section A: Password Strength Analyzer ──
+        c_est, b_est = self._card(tab, "► SECTION A — PASSWORD STRENGTH ESTIMATOR")
+        c_est.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,4))
 
-        # password entry row
-        row = tk.Frame(b_in, bg=BG3); row.pack(fill="x")
+        row = tk.Frame(b_est, bg=BG3); row.pack(fill="x")
         col1 = tk.Frame(row, bg=BG3); col1.pack(side="left", fill="x", expand=True, padx=(0,12))
         col2 = tk.Frame(row, bg=BG3); col2.pack(side="left")
 
@@ -617,24 +658,134 @@ class XDESApp(tk.Tk):
                       lambda pw=p: (self.bf_pw.delete(0,"end"), self.bf_pw.insert(0,pw)),
                       color=ACCENT2).pack(side="left", padx=(0,4), pady=2)
 
-        # note
-        tk.Label(b_in,
-            text="  ⚙  Compares SHA-256 (10 billion/sec GPU) vs Argon2id (10/sec GPU)."
-                 "  Shows why memory-hard KDF is essential.",
+        tk.Label(b_est,
+            text="  ⚙  Compares SHA-256 (10 billion/sec GPU) vs Argon2id (10/sec GPU).",
             font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w", pady=(6,0))
 
-        btn_row = tk.Frame(b_in, bg=BG3, pady=10); btn_row.pack(anchor="w")
+        btn_row = tk.Frame(b_est, bg=BG3, pady=8); btn_row.pack(anchor="w")
         self._btn(btn_row, "  ▶  ANALYZE  ", self._do_bruteforce, color=YELLOW).pack(side="left", padx=(0,8))
-        self._btn(btn_row, "  📋  RUN ALL WEAK PASSWORDS  ", self._do_bruteforce_all, color=RED).pack(side="left", padx=(0,8))
+        self._btn(btn_row, "  📋  RUN ALL WEAK  ", self._do_bruteforce_all, color=RED).pack(side="left", padx=(0,8))
         self._btn(btn_row, "  ✕  CLEAR  ", self._clear_bruteforce, color=BG3).pack(side="left")
 
-        c_out, b_out = self._card(tab, "► ANALYSIS REPORT", pady=8)
-        c_out.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0,16))
-        self.bf_out = self._output_box(b_out, height=16)
+        c_out, b_out = self._card(tab, "► ESTIMATOR OUTPUT", pady=8)
+        c_out.grid(row=1, column=0, sticky="ew", padx=16, pady=(0,4))
+        self.bf_out = self._output_box(b_out, height=8)
 
         self.bf_status = tk.Label(tab, text="Ready.", font=MONO_SM, bg=BG, fg=FG_DIM,
                                   anchor="w", padx=16)
         self.bf_status.grid(row=2, column=0, sticky="ew")
+
+        # ── Section B: Live Brute Force Engine ──
+        c_lbf, b_lbf = self._card(tab, "► SECTION B — LIVE BRUTE FORCE ENGINE  (Task Manager Showcase)")
+        c_lbf.grid(row=3, column=0, sticky="ew", padx=16, pady=(8,4))
+
+        # Info banner
+        info = (
+            "  ⚙  Encrypts a known plaintext with the chosen cipher, then actually brute-forces it\n"
+            "     candidate by candidate.  Watch Task Manager: XDES-A spikes RAM ~64 MB per attempt\n"
+            "     (Argon2id KDF), while standard DES uses negligible memory.  Keep the secret ≤ 3 chars."
+        )
+        tk.Label(b_lbf, text=info, font=MONO_SM, bg=BG3, fg=YELLOW,
+                 justify="left", anchor="w").pack(anchor="w", pady=(0,6))
+
+        tk.Frame(b_lbf, bg=BORDER, height=1).pack(fill="x", pady=(0,8))
+
+        # Row 1: cipher selector + known plaintext + secret password
+        cfg_row = tk.Frame(b_lbf, bg=BG3); cfg_row.pack(fill="x")
+
+        # Cipher selector
+        cipher_col = tk.Frame(cfg_row, bg=BG3); cipher_col.pack(side="left", padx=(0,20))
+        tk.Label(cipher_col, text="CIPHER", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
+
+        self._lbf_cipher = tk.StringVar(value="xdes")
+        des_rb = tk.Radiobutton(
+            cipher_col, text="Standard DES (fast, low RAM)",
+            variable=self._lbf_cipher, value="des",
+            font=MONO_SM, bg=BG3, fg=ACCENT, selectcolor=BG,
+            activebackground=BG3, activeforeground=ACCENT,
+            relief="flat", bd=0
+        )
+        des_rb.pack(anchor="w", pady=2)
+
+        xdes_rb = tk.Radiobutton(
+            cipher_col, text="XDES-A (Argon2id KDF — RAM spiker)",
+            variable=self._lbf_cipher, value="xdes",
+            font=MONO_SM, bg=BG3, fg=GREEN, selectcolor=BG,
+            activebackground=BG3, activeforeground=GREEN,
+            relief="flat", bd=0
+        )
+        xdes_rb.pack(anchor="w", pady=2)
+
+        # Known plaintext
+        pt_col = tk.Frame(cfg_row, bg=BG3); pt_col.pack(side="left", fill="x", expand=True, padx=(0,12))
+        tk.Label(pt_col, text="KNOWN PLAINTEXT  (what we're encrypting)",
+                 font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w")
+        self._lbf_pt = tk.Entry(pt_col, font=MONO, bg=BG, fg=ACCENT, insertbackground=ACCENT,
+                                relief="flat", bd=6, width=20)
+        self._lbf_pt.insert(0, "HELLO")
+        self._lbf_pt.pack(fill="x", ipady=4)
+
+        # Secret (what the attacker is trying to find)
+        sec_col = tk.Frame(cfg_row, bg=BG3); sec_col.pack(side="left", fill="x", expand=True)
+        tk.Label(sec_col, text="SECRET TO FIND  (max 3 chars — the 'real' password)",
+                 font=MONO_SM, bg=BG3, fg=FG_DIM, anchor="w").pack(anchor="w")
+        self._lbf_secret = tk.Entry(sec_col, font=MONO, bg=BG, fg=RED, insertbackground=RED,
+                                    relief="flat", bd=6, width=16)
+        self._lbf_secret.insert(0, "ab")
+        self._lbf_secret.pack(fill="x", ipady=4)
+
+        # Row 2: charset + max length
+        cfg2_row = tk.Frame(b_lbf, bg=BG3); cfg2_row.pack(fill="x", pady=(8,0))
+
+        cs_col = tk.Frame(cfg2_row, bg=BG3); cs_col.pack(side="left", padx=(0,24))
+        tk.Label(cs_col, text="CHARSET", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
+        self._lbf_charset = tk.StringVar(value="alpha")
+        for val, label in [("alpha","a–z only (26)"), ("alphanum","a–z + 0–9 (36)"), ("common","a–z + 0–9 + !@# (39)")]:
+            tk.Radiobutton(cs_col, text=label, variable=self._lbf_charset, value=val,
+                           font=MONO_SM, bg=BG3, fg=FG, selectcolor=BG,
+                           activebackground=BG3, activeforeground=FG,
+                           relief="flat", bd=0).pack(anchor="w")
+
+        ml_col = tk.Frame(cfg2_row, bg=BG3); ml_col.pack(side="left", padx=(0,24))
+        tk.Label(ml_col, text="MAX LENGTH", font=MONO_SM, bg=BG3, fg=FG_DIM).pack(anchor="w")
+        self._lbf_maxlen = tk.StringVar(value="3")
+        for v in ["1","2","3"]:
+            tk.Radiobutton(ml_col, text=f"Up to {v} char(s)", variable=self._lbf_maxlen, value=v,
+                           font=MONO_SM, bg=BG3, fg=FG, selectcolor=BG,
+                           activebackground=BG3, activeforeground=FG,
+                           relief="flat", bd=0).pack(anchor="w")
+
+        # Buttons
+        lbf_btn_row = tk.Frame(b_lbf, bg=BG3, pady=8); lbf_btn_row.pack(anchor="w")
+        self._lbf_start_btn = self._btn(lbf_btn_row, "  ▶  START BRUTE FORCE  ", self._do_live_bf, color=RED)
+        self._lbf_start_btn.pack(side="left", padx=(0,8))
+        self._lbf_stop_btn  = self._btn(lbf_btn_row, "  ■  STOP  ", self._stop_live_bf, color=ORANGE)
+        self._lbf_stop_btn.pack(side="left", padx=(0,8))
+        self._lbf_stop_btn.config(state="disabled")
+
+        # Live stats bar
+        stats_frame = tk.Frame(b_lbf, bg=BG3); stats_frame.pack(fill="x", pady=(4,0))
+        self._lbf_stat_attempt = tk.Label(stats_frame, text="Attempts: —", font=MONO_SM,
+                                          bg=BG3, fg=ACCENT, width=18, anchor="w")
+        self._lbf_stat_attempt.pack(side="left", padx=(0,12))
+        self._lbf_stat_rate = tk.Label(stats_frame, text="Rate: — /s", font=MONO_SM,
+                                       bg=BG3, fg=ACCENT, width=16, anchor="w")
+        self._lbf_stat_rate.pack(side="left", padx=(0,12))
+        self._lbf_stat_time = tk.Label(stats_frame, text="Time: —s", font=MONO_SM,
+                                       bg=BG3, fg=FG_DIM, width=16, anchor="w")
+        self._lbf_stat_time.pack(side="left")
+
+        # Live output
+        c_lbf_out, b_lbf_out = self._card(tab, "► LIVE BRUTE FORCE LOG", pady=6)
+        c_lbf_out.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0,16))
+        tab.rowconfigure(4, weight=1)
+        self._lbf_out = self._output_box(b_lbf_out, height=10)
+
+        self._lbf_status = tk.Label(tab, text="Ready. Configure above and press START.",
+                                    font=MONO_SM, bg=BG, fg=FG_DIM, anchor="w", padx=16)
+        self._lbf_status.grid(row=5, column=0, sticky="ew")
+
+    # ── brute force estimator helpers ───────
 
     def _rating_color_str(self, rating):
         return {"CRITICAL":"⛔","WEAK":"⚠ ","MODERATE":"◈ ","STRONG":"✓ ","VERY STRONG":"✓✓","UNBREAKABLE":"🔒"}.get(rating,"  ")
@@ -649,7 +800,6 @@ class XDESApp(tk.Tk):
         arg_icon = self._rating_color_str(r["argon2_rating"])
         slowdown = r["slowdown_factor"]
 
-        # strength bar (20 chars)
         def bar(secs, max_log=20):
             import math
             if secs <= 0: return "░" * 20
@@ -680,7 +830,7 @@ class XDESApp(tk.Tk):
             f"  {arg_icon} Argon2id (XDES-A) :  {r['argon2_str']:<20}  [{r['argon2_rating']}]",
             f"     {arg_bar}",
             "",
-            f"  ── ARGON2ID ADVANTAGE ───────────────────────────────────",
+            "  ── ARGON2ID ADVANTAGE ───────────────────────────────────",
             f"  Slowdown factor   :  ×{slowdown:,.0f}",
             f"  Meaning           :  Same attack takes {slowdown:,.0f}× longer with Argon2id.",
             "",
@@ -689,25 +839,21 @@ class XDESApp(tk.Tk):
 
         if r["argon2_rating"] in ("STRONG", "VERY STRONG", "UNBREAKABLE"):
             lines += [
-                f"  ✓  This password is RESISTANT under Argon2id.",
-                f"  ✓  Even if the hash is leaked, cracking is infeasible.",
+                "  ✓  This password is RESISTANT under Argon2id.",
+                "  ✓  Even if the hash is leaked, cracking is infeasible.",
             ]
         elif r["sha256_rating"] == "CRITICAL" and r["argon2_rating"] in ("WEAK","MODERATE"):
             lines += [
-                f"  ⚠  SHA-256 alone: cracked instantly.",
-                f"  ◈  Argon2id buys significant time, but a longer password is better.",
+                "  ⚠  SHA-256 alone: cracked instantly.",
+                "  ◈  Argon2id buys significant time, but a longer password is better.",
             ]
         else:
             lines += [
-                f"  ⛔  This password is WEAK even with Argon2id.",
-                f"  ⛔  Use a longer password with mixed characters.",
+                "  ⛔  This password is WEAK even with Argon2id.",
+                "  ⛔  Use a longer password with mixed characters.",
             ]
 
-        lines += [
-            "",
-            "  → Try one of the strong presets above to see the difference.",
-        ]
-
+        lines += ["", "  → Try one of the strong presets above to see the difference."]
         self._write(self.bf_out, "\n".join(lines))
         self._status(self.bf_status,
             f"✓  SHA-256: {r['sha256_str']}  │  Argon2id: {r['argon2_str']}  │  Slowdown: ×{slowdown:,.0f}",
@@ -732,7 +878,6 @@ class XDESApp(tk.Tk):
                 f"{arg_icon}{r['argon2_str']:<18}  "
                 f"×{r['slowdown_factor']:,.0f}"
             )
-
         lines += [
             "",
             "  ── KEY INSIGHT ──────────────────────────────────────────",
@@ -748,3 +893,157 @@ class XDESApp(tk.Tk):
         self.bf_pw.delete(0, "end")
         self._write(self.bf_out, "")
         self._status(self.bf_status, "Cleared.")
+
+    # ── live brute force engine ──────────────
+
+    def _do_live_bf(self):
+        if self._bf_running:
+            return
+
+        pt_str     = self._lbf_pt.get().strip()
+        secret     = self._lbf_secret.get().strip()
+        cipher     = self._lbf_cipher.get()
+        charset_id = self._lbf_charset.get()
+        max_len    = int(self._lbf_maxlen.get())
+
+        if not pt_str:
+            self._write(self._lbf_out, "⚠  Enter a known plaintext.")
+            return
+        if not secret:
+            self._write(self._lbf_out, "⚠  Enter a secret to brute-force.")
+            return
+        if len(secret) > 4:
+            self._write(self._lbf_out, "⚠  Secret must be ≤ 4 characters for a live demo.")
+            return
+
+        charset_map = {
+            "alpha":    BRUTE_CHARSET_ALPHA,
+            "alphanum": BRUTE_CHARSET_ALPHANUM,
+            "common":   BRUTE_CHARSET_COMMON,
+        }
+        charset = charset_map[charset_id]
+
+        # Pre-compute target ciphertext so attacker has something to match against
+        pt_b = pt_str.encode("utf-8")
+
+        if cipher == "des":
+            key8      = _candidate_to_des_key(secret)
+            target_ct = des_encrypt_block(pt_b[:8].ljust(8, b'\x00'), key8)
+            argon_salt = None
+        else:
+            argon_salt = bytes(16)   # fixed zero salt for demo repeatability
+            keys       = derive_keys(secret.encode(), argon_salt)
+            pt16       = (pt_b + bytes(16))[:16]
+            target_ct  = xdes_encrypt_block(pt16, keys)
+
+        cipher_label = "Standard DES" if cipher == "des" else "XDES-A (Argon2id)"
+
+        header = [
+            "╔══════════════════════════════════════════════════════════╗",
+            f"║  LIVE BRUTE FORCE  —  {cipher_label:<34}║",
+            "╚══════════════════════════════════════════════════════════╝",
+            "",
+            f"  Known plaintext  :  {pt_str!r}",
+            f"  Target ciphertext:  {target_ct.hex().upper()}",
+            f"  Charset          :  {charset_id}  ({len(charset)} chars)",
+            f"  Max length       :  {max_len}",
+            f"  Secret (hidden)  :  {'•' * len(secret)}",
+            "",
+            f"  ── LIVE LOG ─────────────────────────────────────────────",
+            "",
+        ]
+        self._write(self._lbf_out, "\n".join(header))
+
+        # Rate tracking
+        self._lbf_last_update = time.perf_counter()
+        self._lbf_last_count  = 0
+
+        self._bf_running = True
+        self._bf_stop_event.clear()
+        self._lbf_start_btn.config(state="disabled")
+        self._lbf_stop_btn.config(state="normal")
+        self._status(self._lbf_status, f"⏳  Brute-forcing with {cipher_label}…  Open Task Manager!", YELLOW)
+
+        def on_attempt(attempt, candidate, elapsed, mem_mb, found):
+            # Throttle UI updates to every 50 attempts or on find
+            if attempt % 50 != 0 and not found:
+                return
+
+            now  = time.perf_counter()
+            dt   = now - self._lbf_last_update
+            rate = (attempt - self._lbf_last_count) / dt if dt > 0.01 else 0
+            self._lbf_last_update = now
+            self._lbf_last_count  = attempt
+
+            prefix = "  ✓  FOUND! " if found else "  ···  "
+            line   = f"{prefix}[#{attempt:>6}]  trying: {candidate!r:<8}  " \
+                     f"elapsed: {elapsed:6.2f}s  mem: {mem_mb:6.1f}MB\n"
+
+            self.after(0, lambda l=line: self._append(self._lbf_out, l))
+            self.after(0, lambda: self._lbf_stat_attempt.config(text=f"Attempts: {attempt:,}"))
+            self.after(0, lambda: self._lbf_stat_rate.config(text=f"Rate: {rate:,.0f}/s"))
+            self.after(0, lambda: self._lbf_stat_time.config(text=f"Time: {elapsed:.1f}s"))
+
+        def on_done(found, candidate, attempt, elapsed):
+            if found:
+                summary = (
+                    f"\n"
+                    f"  ╔══════════════════════════════════╗\n"
+                    f"  ║  🔓  SECRET CRACKED!             ║\n"
+                    f"  ╚══════════════════════════════════╝\n"
+                    f"\n"
+                    f"  Found: {candidate!r}\n"
+                    f"  Attempts : {attempt:,}\n"
+                    f"  Time     : {elapsed:.2f}s\n"
+                    f"  Avg rate : {attempt/max(elapsed,0.001):,.0f} attempts/sec\n"
+                    f"\n"
+                    f"  {'DES note: trivial RAM, fast — no KDF protection.' if cipher == 'des' else 'XDES-A note: each attempt needed ~64MB Argon2id — see Task Manager!'}\n"
+                )
+            else:
+                summary = (
+                    f"\n"
+                    f"  ⚠  Secret not found in search space.\n"
+                    f"  Attempts: {attempt:,}  Time: {elapsed:.2f}s\n"
+                )
+            self.after(0, lambda: self._append(self._lbf_out, summary))
+            self.after(0, lambda: self._status(
+                self._lbf_status,
+                f"✓  Done — {attempt:,} attempts in {elapsed:.2f}",
+                GREEN if found else YELLOW))
+            self.after(0, self._bf_reset_buttons)
+
+        def run():
+            try:
+                if cipher == "des":
+                    brute_force_des(
+                        target_ct, pt_b[:8].ljust(8, b'\x00'),
+                        max_len, charset,
+                        self._bf_stop_event, on_attempt, on_done
+                    )
+                else:
+                    brute_force_xdes(
+                        target_ct, pt_b,
+                        argon_salt,
+                        max_len, charset,
+                        self._bf_stop_event, on_attempt, on_done
+                    )
+            except Exception as ex:
+                self.after(0, lambda: self._append(self._lbf_out, f"\n  ⚠  Error: {ex}\n"))
+                self.after(0, self._bf_reset_buttons)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+
+    def _stop_live_bf(self):
+        self._bf_stop_event.set()
+        self._status(self._lbf_status, "⏹  Stopping…", ORANGE)
+
+    def _bf_reset_buttons(self):
+        self._bf_running = False
+        self._lbf_start_btn.config(state="normal")
+        self._lbf_stop_btn.config(state="disabled")
+
+
+if __name__ == "__main__":
+    app = XDESApp()
+    app.mainloop()
